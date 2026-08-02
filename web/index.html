@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>心理内容 AI 运营助手</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>心理内容 AI 运营助手</h1>
+        <p>问题池、知识库、个人风格和人工反馈闭环的本机工作台</p>
+      </div>
+      <div class="model-pill" id="modelStatus">加载中</div>
+    </header>
+
+    <main class="layout">
+      <section class="panel question-panel">
+        <div class="section-head">
+          <h2>推荐回答问题</h2>
+          <button id="refreshBtn">刷新</button>
+        </div>
+        <div id="questionList" class="question-list"></div>
+
+        <details class="adder">
+          <summary>添加问题</summary>
+          <label>标题<input id="qTitle" /></label>
+          <label>链接<input id="qUrl" /></label>
+          <label>标签<input id="qTags" placeholder="拖延,亲密关系" /></label>
+          <label>热度<input id="qHeat" type="number" value="50" /></label>
+          <label>描述<textarea id="qDesc"></textarea></label>
+          <button id="addQuestionBtn">加入问题池</button>
+        </details>
+      </section>
+
+      <section class="panel work-panel">
+        <div class="empty-state" id="emptyState">先在左侧选择一个问题。</div>
+        <div id="workspace" class="workspace hidden">
+          <div class="question-detail">
+            <span id="selectedTags" class="tags"></span>
+            <h2 id="selectedTitle"></h2>
+            <p id="selectedDesc"></p>
+            <a id="selectedUrl" target="_blank"></a>
+          </div>
+
+          <div class="actions">
+            <button class="primary" id="generateBtn">生成 AI 初稿</button>
+            <button id="searchBtn">只检索知识库</button>
+          </div>
+
+          <div class="split">
+            <div>
+              <h3>检索到的依据</h3>
+              <div id="contextList" class="context-list"></div>
+            </div>
+            <div>
+              <h3>AI 初稿 / 人工终稿</h3>
+              <textarea id="answerBox" class="answer-box" placeholder="生成后会出现在这里，也可以直接编辑。"></textarea>
+              <button id="saveEditBtn">保存人工终稿并学习风格</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <aside class="panel side-panel">
+        <h2>个人风格画像</h2>
+        <textarea id="personaBox" class="persona-box"></textarea>
+        <button id="savePersonaBtn">保存风格</button>
+
+        <h2>知识库</h2>
+        <div id="documentList" class="document-list"></div>
+        <details class="adder" open>
+          <summary>导入文本</summary>
+          <label>标题<input id="docTitle" /></label>
+          <label>来源<input id="docSource" placeholder="书摘 / 自有笔记 / 授权内容" /></label>
+          <label>内容<textarea id="docContent"></textarea></label>
+          <button id="addDocBtn">加入知识库</button>
+        </details>
+
+        <h2>最近反馈</h2>
+        <div id="feedbackList" class="feedback-list"></div>
+      </aside>
+    </main>
+
+    <div id="toast" class="toast hidden"></div>
+    <script src="/app.js"></script>
+  </body>
+</html>
+
