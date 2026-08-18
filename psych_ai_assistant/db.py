@@ -49,7 +49,50 @@ class Database:
                     content text not null,
                     embedding_json text,
                     embedding_model text,
+                    chunk_size integer,
+                    chunk_overlap integer,
                     created_at datetime default current_timestamp
+                );
+
+                create table if not exists document_summaries (
+                    document_id integer primary key,
+                    summary text not null,
+                    embedding_json text,
+                    embedding_model text,
+                    summary_model text,
+                    chunk_size integer,
+                    chunk_overlap integer,
+                    created_at datetime default current_timestamp,
+                    updated_at datetime default current_timestamp
+                );
+
+                create table if not exists sentence_nodes (
+                    id integer primary key autoincrement,
+                    document_id integer not null,
+                    sentence_index integer not null,
+                    sentence text not null,
+                    window text not null,
+                    embedding_json text,
+                    embedding_model text,
+                    window_size integer,
+                    created_at datetime default current_timestamp
+                );
+
+                create table if not exists hierarchy_nodes (
+                    id integer primary key autoincrement,
+                    document_id integer not null,
+                    node_key text not null,
+                    level integer not null,
+                    chunk_index integer not null,
+                    parent_key text,
+                    content text not null,
+                    embedding_json text,
+                    embedding_model text,
+                    chunk_size integer,
+                    start_char integer,
+                    end_char integer,
+                    created_at datetime default current_timestamp,
+                    unique(document_id, node_key)
                 );
 
                 create table if not exists answers (
@@ -126,10 +169,28 @@ class Database:
         }
         if "folder" not in document_columns:
             conn.execute("alter table documents add column folder text default '默认'")
-        conn.execute(
-            "insert or ignore into knowledge_folders (name) values (?)",
-            ("默认",),
-        )
+        chunk_columns = {
+            row["name"] for row in conn.execute("pragma table_info(document_chunks)").fetchall()
+        }
+        if "chunk_size" not in chunk_columns:
+            conn.execute("alter table document_chunks add column chunk_size integer")
+        if "chunk_overlap" not in chunk_columns:
+            conn.execute("alter table document_chunks add column chunk_overlap integer")
+        summary_columns = {
+            row["name"] for row in conn.execute("pragma table_info(document_summaries)").fetchall()
+        }
+        if "chunk_size" not in summary_columns:
+            conn.execute("alter table document_summaries add column chunk_size integer")
+        if "chunk_overlap" not in summary_columns:
+            conn.execute("alter table document_summaries add column chunk_overlap integer")
+        hierarchy_columns = {
+            row["name"] for row in conn.execute("pragma table_info(hierarchy_nodes)").fetchall()
+        }
+        if hierarchy_columns:
+            if "start_char" not in hierarchy_columns:
+                conn.execute("alter table hierarchy_nodes add column start_char integer")
+            if "end_char" not in hierarchy_columns:
+                conn.execute("alter table hierarchy_nodes add column end_char integer")
         for row in conn.execute(
             "select distinct coalesce(folder, '默认') as folder from documents"
         ).fetchall():
@@ -238,7 +299,6 @@ class Database:
 
     def list_document_folders(self):
         with self.connect() as conn:
-            conn.execute("insert or ignore into knowledge_folders (name) values (?)", ("默认",))
             rows = conn.execute(
                 """
                 select name as folder from knowledge_folders
@@ -248,7 +308,7 @@ class Database:
                 """
             ).fetchall()
         folders = [row["folder"] for row in rows if row["folder"]]
-        return folders or ["默认"]
+        return folders
 
     def add_document_folder(self, name):
         name = (name or "").strip()
@@ -277,10 +337,6 @@ class Database:
             if count:
                 raise ValueError("文件夹里还有资料，不能删除")
             conn.execute("delete from knowledge_folders where name = ?", (name,))
-            conn.execute(
-                "insert or ignore into knowledge_folders (name) values (?)",
-                ("默认",),
-            )
         return 0
 
     def add_document(self, title, source, content, folder="默认"):
@@ -358,6 +414,9 @@ class Database:
     def delete_document(self, document_id):
         with self.connect() as conn:
             conn.execute("delete from document_chunks where document_id = ?", (document_id,))
+            conn.execute("delete from document_summaries where document_id = ?", (document_id,))
+            conn.execute("delete from sentence_nodes where document_id = ?", (document_id,))
+            conn.execute("delete from hierarchy_nodes where document_id = ?", (document_id,))
             conn.execute("delete from documents where id = ?", (document_id,))
 
     def delete_documents_by_source(self, source):
@@ -368,6 +427,9 @@ class Database:
             ]
             for document_id in ids:
                 conn.execute("delete from document_chunks where document_id = ?", (document_id,))
+                conn.execute("delete from document_summaries where document_id = ?", (document_id,))
+                conn.execute("delete from sentence_nodes where document_id = ?", (document_id,))
+                conn.execute("delete from hierarchy_nodes where document_id = ?", (document_id,))
             conn.execute("delete from documents where source = ?", (source,))
 
     def replace_document_chunks(self, document_id, chunk_items):
@@ -376,8 +438,11 @@ class Database:
             conn.executemany(
                 """
                 insert into document_chunks
-                    (document_id, chunk_index, content, embedding_json, embedding_model)
-                values (?, ?, ?, ?, ?)
+                    (
+                        document_id, chunk_index, content, embedding_json,
+                        embedding_model, chunk_size, chunk_overlap
+                    )
+                values (?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -388,8 +453,100 @@ class Database:
                         if item.get("embedding") is not None
                         else None,
                         item.get("embedding_model"),
+                        item.get("chunk_size"),
+                        item.get("chunk_overlap"),
                     )
                     for item in chunk_items
+                ],
+            )
+
+    def replace_document_summary(self, document_id, summary_item):
+        with self.connect() as conn:
+            conn.execute(
+                """
+                insert into document_summaries (
+                    document_id, summary, embedding_json, embedding_model,
+                    summary_model, chunk_size, chunk_overlap, updated_at
+                )
+                values (?, ?, ?, ?, ?, ?, ?, current_timestamp)
+                on conflict(document_id) do update set
+                    summary = excluded.summary,
+                    embedding_json = excluded.embedding_json,
+                    embedding_model = excluded.embedding_model,
+                    summary_model = excluded.summary_model,
+                    chunk_size = excluded.chunk_size,
+                    chunk_overlap = excluded.chunk_overlap,
+                    updated_at = current_timestamp
+                """,
+                (
+                    document_id,
+                    summary_item["summary"],
+                    json.dumps(summary_item.get("embedding"), ensure_ascii=False)
+                    if summary_item.get("embedding") is not None
+                    else None,
+                    summary_item.get("embedding_model"),
+                    summary_item.get("summary_model"),
+                    summary_item.get("chunk_size"),
+                    summary_item.get("chunk_overlap"),
+                ),
+            )
+
+    def replace_sentence_nodes(self, document_id, sentence_items):
+        with self.connect() as conn:
+            conn.execute("delete from sentence_nodes where document_id = ?", (document_id,))
+            conn.executemany(
+                """
+                insert into sentence_nodes (
+                    document_id, sentence_index, sentence, window,
+                    embedding_json, embedding_model, window_size
+                )
+                values (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        document_id,
+                        item["sentence_index"],
+                        item["sentence"],
+                        item["window"],
+                        json.dumps(item.get("embedding"), ensure_ascii=False)
+                        if item.get("embedding") is not None
+                        else None,
+                        item.get("embedding_model"),
+                        item.get("window_size"),
+                    )
+                    for item in sentence_items
+                ],
+            )
+
+    def replace_hierarchy_nodes(self, document_id, hierarchy_items):
+        with self.connect() as conn:
+            conn.execute("delete from hierarchy_nodes where document_id = ?", (document_id,))
+            conn.executemany(
+                """
+                insert into hierarchy_nodes (
+                    document_id, node_key, level, chunk_index, parent_key,
+                    content, embedding_json, embedding_model, chunk_size,
+                    start_char, end_char
+                )
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        document_id,
+                        item["node_key"],
+                        item["level"],
+                        item["chunk_index"],
+                        item.get("parent_key"),
+                        item["content"],
+                        json.dumps(item.get("embedding"), ensure_ascii=False)
+                        if item.get("embedding") is not None
+                        else None,
+                        item.get("embedding_model"),
+                        item.get("chunk_size"),
+                        item.get("start_char"),
+                        item.get("end_char"),
+                    )
+                    for item in hierarchy_items
                 ],
             )
 
@@ -418,11 +575,138 @@ class Database:
             items.append(item)
         return items
 
+    def list_document_summaries(self, document_id=None):
+        sql = """
+            select
+                document_summaries.*,
+                documents.title,
+                documents.source,
+                coalesce(documents.folder, '默认') as folder
+            from document_summaries
+            join documents on documents.id = document_summaries.document_id
+        """
+        params = []
+        if document_id is not None:
+            sql += " where document_summaries.document_id = ?"
+            params.append(document_id)
+        sql += " order by documents.id desc"
+        with self.connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        items = []
+        for row in rows:
+            item = self.row_to_dict(row)
+            item["embedding"] = (
+                json.loads(item["embedding_json"]) if item.get("embedding_json") else None
+            )
+            items.append(item)
+        return items
+
+    def list_sentence_nodes(self, document_id=None):
+        sql = """
+            select
+                sentence_nodes.*,
+                documents.title,
+                documents.source,
+                coalesce(documents.folder, '默认') as folder
+            from sentence_nodes
+            join documents on documents.id = sentence_nodes.document_id
+        """
+        params = []
+        if document_id is not None:
+            sql += " where sentence_nodes.document_id = ?"
+            params.append(document_id)
+        sql += " order by documents.id desc, sentence_nodes.sentence_index asc"
+        with self.connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        items = []
+        for row in rows:
+            item = self.row_to_dict(row)
+            item["embedding"] = (
+                json.loads(item["embedding_json"]) if item.get("embedding_json") else None
+            )
+            items.append(item)
+        return items
+
+    def list_hierarchy_nodes(self, document_id=None, level=None):
+        sql = """
+            select
+                hierarchy_nodes.*,
+                documents.title,
+                documents.source,
+                coalesce(documents.folder, '默认') as folder
+            from hierarchy_nodes
+            join documents on documents.id = hierarchy_nodes.document_id
+        """
+        params = []
+        where = []
+        if document_id is not None:
+            where.append("hierarchy_nodes.document_id = ?")
+            params.append(document_id)
+        if level is not None:
+            where.append("hierarchy_nodes.level = ?")
+            params.append(level)
+        if where:
+            sql += " where " + " and ".join(where)
+        sql += " order by documents.id desc, hierarchy_nodes.level asc, hierarchy_nodes.chunk_index asc"
+        with self.connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        items = []
+        for row in rows:
+            item = self.row_to_dict(row)
+            item["embedding"] = (
+                json.loads(item["embedding_json"]) if item.get("embedding_json") else None
+            )
+            items.append(item)
+        return items
+
+    def get_hierarchy_node(self, document_id, node_key):
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                select
+                    hierarchy_nodes.*,
+                    documents.title,
+                    documents.source,
+                    coalesce(documents.folder, '默认') as folder
+                from hierarchy_nodes
+                join documents on documents.id = hierarchy_nodes.document_id
+                where hierarchy_nodes.document_id = ? and hierarchy_nodes.node_key = ?
+                """,
+                (document_id, node_key),
+            ).fetchone()
+        item = self.row_to_dict(row)
+        if item:
+            item["embedding"] = (
+                json.loads(item["embedding_json"]) if item.get("embedding_json") else None
+            )
+        return item
+
+    def hierarchy_child_count(self, document_id, parent_key):
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                select count(*) as count
+                from hierarchy_nodes
+                where document_id = ? and parent_key = ?
+                """,
+                (document_id, parent_key),
+            ).fetchone()
+        return row["count"] if row else 0
+
     def document_index_status(self):
         statuses = []
         for doc in self.list_documents():
             chunks = self.list_document_chunks(doc["id"])
+            summaries = self.list_document_summaries(doc["id"])
+            sentence_nodes = self.list_sentence_nodes(doc["id"])
+            hierarchy_nodes = self.list_hierarchy_nodes(doc["id"])
             embedded = [chunk for chunk in chunks if chunk.get("embedding")]
+            embedded_sentences = [node for node in sentence_nodes if node.get("embedding")]
+            embedded_hierarchy_leaf = [
+                node
+                for node in hierarchy_nodes
+                if node.get("level") == 0 and node.get("embedding")
+            ]
             models = sorted(
                 {
                     chunk.get("embedding_model")
@@ -436,6 +720,37 @@ class Database:
                     "chunk_count": len(chunks),
                     "embedded_count": len(embedded),
                     "embedding_models": models,
+                    "summary_indexed": bool(summaries),
+                    "summary_embedded": bool(summaries) and bool(summaries[0].get("embedding")),
+                    "summary_model": summaries[0].get("summary_model") if summaries else None,
+                    "summary_embedding_model": summaries[0].get("embedding_model")
+                    if summaries
+                    else None,
+                    "chunk_sizes": sorted(
+                        {
+                            chunk.get("chunk_size")
+                            for chunk in chunks
+                            if chunk.get("chunk_size")
+                        }
+                    ),
+                    "chunk_overlaps": sorted(
+                        {
+                            chunk.get("chunk_overlap")
+                            for chunk in chunks
+                            if chunk.get("chunk_overlap")
+                        }
+                    ),
+                    "sentence_node_count": len(sentence_nodes),
+                    "sentence_embedded_count": len(embedded_sentences),
+                    "sentence_indexed": bool(sentence_nodes),
+                    "sentence_fully_embedded": bool(sentence_nodes)
+                    and len(sentence_nodes) == len(embedded_sentences),
+                    "hierarchy_node_count": len(hierarchy_nodes),
+                    "hierarchy_leaf_count": len(
+                        [node for node in hierarchy_nodes if node.get("level") == 0]
+                    ),
+                    "hierarchy_leaf_embedded_count": len(embedded_hierarchy_leaf),
+                    "hierarchy_indexed": bool(hierarchy_nodes),
                     "indexed": bool(chunks),
                     "fully_embedded": bool(chunks) and len(chunks) == len(embedded),
                 }
@@ -450,6 +765,9 @@ class Database:
                 "knowledge_folders",
                 "documents",
                 "document_chunks",
+                "document_summaries",
+                "sentence_nodes",
+                "hierarchy_nodes",
                 "answers",
                 "generation_runs",
                 "style_memories",
@@ -464,8 +782,24 @@ class Database:
             chunk_chars = conn.execute(
                 "select coalesce(sum(length(content)), 0) as size from document_chunks"
             ).fetchone()["size"]
+            summary_chars = conn.execute(
+                "select coalesce(sum(length(summary)), 0) as size from document_summaries"
+            ).fetchone()["size"]
             embedded_chunks = conn.execute(
                 "select count(*) as count from document_chunks where embedding_json is not null"
+            ).fetchone()["count"]
+            embedded_summaries = conn.execute(
+                "select count(*) as count from document_summaries where embedding_json is not null"
+            ).fetchone()["count"]
+            embedded_sentences = conn.execute(
+                "select count(*) as count from sentence_nodes where embedding_json is not null"
+            ).fetchone()["count"]
+            embedded_hierarchy_leaf = conn.execute(
+                """
+                select count(*) as count
+                from hierarchy_nodes
+                where level = 0 and embedding_json is not null
+                """
             ).fetchone()["count"]
             embedding_models = [
                 row["embedding_model"]
@@ -484,7 +818,11 @@ class Database:
             "tables": tables,
             "document_chars": doc_chars,
             "chunk_chars": chunk_chars,
+            "summary_chars": summary_chars,
             "embedded_chunks": embedded_chunks,
+            "embedded_summaries": embedded_summaries,
+            "embedded_sentences": embedded_sentences,
+            "embedded_hierarchy_leaf": embedded_hierarchy_leaf,
             "embedding_models": embedding_models,
         }
 
@@ -624,6 +962,22 @@ class Database:
                 where id = ?
                 """,
                 (rating, 1 if is_satisfied else 0, note, run_id),
+            )
+
+    def update_generation_run_feedback(self, run_id, feedback):
+        if not run_id:
+            return
+        current = self.get_generation_run(run_id) or {}
+        merged = current.get("feedback") or {}
+        merged.update(feedback or {})
+        with self.connect() as conn:
+            conn.execute(
+                """
+                update generation_runs
+                set feedback_json = ?, updated_at = current_timestamp
+                where id = ?
+                """,
+                (json.dumps(merged, ensure_ascii=False), run_id),
             )
 
     def get_answer(self, answer_id):

@@ -59,6 +59,12 @@ def build_answer_prompt(
 
     return f"""请为一个知乎心理类问题生成回答初稿。
 
+【优先级】
+1. 最高优先级：意图识别和人工意见、长期风格记忆。
+2. 其次：通用回答 Prompt。
+3. 最后：个人语气文档和可引用知识片段。
+如果不同部分互相冲突，必须优先服从人工意见和长期风格记忆。
+
 【问题标题】
 {question['title']}
 
@@ -83,8 +89,149 @@ def build_answer_prompt(
 【可引用知识片段】
 {context_text}
 
+【反矫情写作约束】
+如果人工意见或长期风格记忆中出现“太矫情、太空洞、太 AI、太抒情、不要编例子、不要瞎编”等意思，必须执行：
+- 不使用诗化比喻、感官化抒情、排比式设问、强行共情收尾。
+- 不用“轻轻一沉、像什么落进胸口、你有没有过这种时候”这类句式。
+- 优先使用清楚的判断、概念解释、场景对比和具体行动。
+- 可以有温度，但表达要平实、克制、像一个人在认真说明问题。
+- 不编造研究者、年份、数据或个人经历；除非可引用知识片段中明确提供。
+
 【任务】
-请根据通用回答 Prompt、个人语气文档、长期风格记忆、意图识别和人工意见，以及可引用知识片段，输出一版完整回答初稿。
+请根据上述材料输出一版完整回答初稿。不要解释你遵守了哪些规则，直接输出正文。
+"""
+
+
+def build_revision_feedback_memory_prompt(question, instruction, current_draft=""):
+    return f"""请把用户这次对 AI 回答的评价，提炼成以后可长期复用的回答 Prompt 规则。
+
+【问题标题】
+{question['title']}
+
+【用户本次评价】
+{instruction or '无'}
+
+【被评价的当前稿件】
+{current_draft or '无'}
+
+【任务】
+请输出 1-3 条可以长期加入 Prompt 的写作规则，用于以后生成同类知乎心理类回答。
+
+要求：
+1. 保留用户评价里的真实偏好，不要过度扩写。
+2. 把具体问题里的局部意见，抽象成可复用规则。
+3. 不记录私人经历、人名、地点、账号或联系方式。
+4. 不要输出解释，只输出规则。
+
+格式：
+
+【长期回答 Prompt】
+- ...
+"""
+
+
+def build_document_summary_prompt(title, content):
+    return f"""请为下面这份知识库资料生成一段用于 RAG 路由检索的中文摘要。
+
+这段摘要不是最终回答，它的用途是帮助系统判断“用户问题应该优先检索哪份资料”。
+
+要求：
+1. 保留资料的核心主题、关键概念、适用问题、重要人物/书名/理论名。
+2. 如果资料较长，请按主题概括，不要逐页复述。
+3. 不要新增原文没有的观点、案例、数据。
+4. 输出 300-800 字中文摘要；如果原文很短，可以更短。
+5. 只输出摘要正文，不要解释你的处理过程。
+
+【资料标题】
+{title}
+
+【资料正文】
+{content}
+"""
+
+
+def build_document_section_summary_prompt(title, section_index, section_total, content):
+    return f"""请为下面这份长文档的一个片段生成局部摘要，用于后续合成全文 RAG 路由摘要。
+
+要求：
+1. 只概括这个片段里真实出现的主题、概念、人物、理论、案例。
+2. 不要补充片段外的知识。
+3. 输出 120-220 字中文摘要。
+4. 只输出摘要正文。
+
+【资料标题】
+{title}
+
+【片段位置】
+第 {section_index} / {section_total} 段
+
+【片段正文】
+{content}
+"""
+
+
+def build_document_summary_merge_prompt(title, section_summaries):
+    return f"""请把下面这些局部摘要合并成一段用于 RAG 路由检索的中文文档摘要。
+
+这段摘要的用途是帮助系统判断“用户问题应该优先检索哪份资料”，不是最终回答依据。
+
+要求：
+1. 覆盖不同片段中反复出现或重要的主题。
+2. 保留关键概念、适用问题、重要人物/书名/理论名。
+3. 不要新增局部摘要里没有的信息。
+4. 输出 300-900 字中文摘要。
+5. 只输出摘要正文，不要解释过程。
+
+【资料标题】
+{title}
+
+【局部摘要】
+{section_summaries}
+"""
+
+
+def build_rag_triad_eval_prompt(question, answer, context):
+    context_text = format_context(context)
+    return f"""请作为 RAG 评估器，评估下面这次回答。
+
+请使用 RAG Triad 三个指标：
+1. answer_relevance：回答是否切题，是否真正回应用户问题。
+2. context_relevance：检索片段是否和用户问题相关。
+3. groundedness：回答中的关键判断是否被检索片段支持。
+
+评分范围为 0 到 1，1 表示很好，0 表示很差。
+
+请同时给出 next_actions。它不是泛泛建议，而是下一步工作流动作：
+- answer_relevance 低：建议回到意图识别，重新明确问题真正要回答什么。
+- context_relevance 低：建议补充检索 query、扩大候选文档数、切换检索方式，重新检索。
+- groundedness 低：建议重写回答，减少未被检索支持的判断；把无法从片段推出的内容标注为一般建议；增加回答观点与检索片段的对应关系。
+
+【问题标题】
+{question['title']}
+
+【问题描述】
+{question.get('description') or '无'}
+
+【回答】
+{answer or '无'}
+
+【检索片段】
+{context_text}
+
+请只输出 JSON，不要输出 Markdown，不要解释 JSON 之外的内容。
+
+格式：
+{{
+  "answer_relevance": {{"score": 0.0, "reason": "..."}},
+  "context_relevance": {{"score": 0.0, "reason": "..."}},
+  "groundedness": {{"score": 0.0, "reason": "..."}},
+  "suggestion": "综合改进建议",
+  "next_actions": [
+    {{"type": "revise_answer", "priority": "high", "reason": "...", "instruction": "可直接复制到重写意见里的具体要求"}},
+    {{"type": "improve_retrieval", "priority": "medium", "reason": "...", "instruction": "下一轮检索应该补充的关键词或方向"}},
+    {{"type": "rerun_intent", "priority": "low", "reason": "...", "instruction": "意图识别需要重新明确的点"}}
+  ]
+}}
 """
 
 

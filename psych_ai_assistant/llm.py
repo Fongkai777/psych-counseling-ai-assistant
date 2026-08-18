@@ -1,37 +1,85 @@
 import json
+import logging
+import http.client
+import socket
+import time
 import urllib.error
 import urllib.request
 
 
+LOGGER = logging.getLogger(__name__)
+
+
+class EmbeddingAPIError(Exception):
+    pass
+
+
 class LLMClient:
     def __init__(self, config):
-        self.api_key = config.get("LLM_API_KEY", "")
+        self.api_key = config.get("LLM_API_KEY") or config.get("DASHSCOPE_API_KEY") or ""
+        self.dashscope_api_key = config.get("DASHSCOPE_API_KEY") or self.api_key
+        self.provider = (config.get("LLM_PROVIDER") or "openai_compatible").strip()
         self.base_url = (config.get("LLM_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
         self.model = config.get("LLM_MODEL") or "gpt-5.4-mini"
         self.temperature = float(config.get("LLM_TEMPERATURE") or 0.7)
+        self.enable_thinking = str(config.get("LLM_ENABLE_THINKING", "")).lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         self.embedding_api_key = config.get("EMBEDDING_API_KEY") or self.api_key
         self.embedding_base_url = (
             config.get("EMBEDDING_BASE_URL") or self.base_url
         ).rstrip("/")
         self.embedding_model = config.get("EMBEDDING_MODEL") or "text-embedding-3-small"
+        self.embedding_batch_size = max(1, min(20, int(config.get("EMBEDDING_BATCH_SIZE") or 5)))
+        self.rerank_enabled = str(config.get("RERANK_ENABLED", "")).lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self.last_embedding_error = ""
 
     def status(self):
         return {
-            "mode": "api" if self.api_key else "demo",
+            "mode": self.provider if self.api_key else "demo",
             "model": self.model,
             "base_url": self.base_url,
             "embedding_mode": "api" if self.embedding_api_key else "local",
             "embedding_model": self.embedding_model,
+            "embedding_batch_size": self.embedding_batch_size,
+            "rerank_mode": "llm" if self.rerank_enabled and self.api_key else "off",
         }
 
-    def chat_payload(self, prompt):
-        return {
+    def chat_payload(self, prompt, enable_thinking=None):
+        payload = {
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": self.temperature,
         }
+        use_thinking = self.enable_thinking if enable_thinking is None else enable_thinking
+        if use_thinking:
+            payload["enable_thinking"] = True
+        return payload
 
     def chat_curl(self, prompt):
+        if self.provider == "dashscope_native":
+            payload = {
+                "model": self.model,
+                "messages": [{"role": "user", "content": [{"text": prompt}]}],
+            }
+            return (
+                "# DashScope native SDK call\n"
+                "import dashscope\n"
+                "dashscope.base_http_api_url = 'https://dashscope.aliyuncs.com/api/v1'\n"
+                "response = dashscope.MultiModalConversation.call(\n"
+                "  api_key='***REDACTED***',\n"
+                f"  model={self.model!r},\n"
+                f"  messages={payload['messages']!r},\n"
+                ")\n"
+            )
         payload = self.chat_payload(prompt)
         return (
             "curl -X POST "
@@ -42,11 +90,13 @@ class LLMClient:
             + repr(json.dumps(payload, ensure_ascii=False, indent=2))
         )
 
-    def generate(self, prompt):
+    def generate(self, prompt, enable_thinking=None, timeout=90):
         if not self.api_key:
             return self.demo_answer(prompt)
+        if self.provider == "dashscope_native":
+            return self.generate_dashscope_native(prompt)
 
-        payload = self.chat_payload(prompt)
+        payload = self.chat_payload(prompt, enable_thinking=enable_thinking)
         req = urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
@@ -57,10 +107,46 @@ class LLMClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=90) as response:
+            with urllib.request.urlopen(req, timeout=timeout) as response:
                 data = json.loads(response.read().decode("utf-8"))
             return data["choices"][0]["message"]["content"]
-        except (urllib.error.URLError, KeyError, IndexError, json.JSONDecodeError) as exc:
+        except (
+            urllib.error.URLError,
+            socket.timeout,
+            TimeoutError,
+            KeyError,
+            IndexError,
+            json.JSONDecodeError,
+        ) as exc:
+            return (
+                "模型 API 调用失败，以下是本地演示草稿。\n\n"
+                f"失败原因：{exc}\n\n"
+                + self.demo_answer(prompt)
+            )
+
+    def generate_dashscope_native(self, prompt):
+        try:
+            import dashscope
+
+            dashscope.base_http_api_url = "https://dashscope.aliyuncs.com/api/v1"
+            response = dashscope.MultiModalConversation.call(
+                api_key=self.dashscope_api_key,
+                model=self.model,
+                messages=[{"role": "user", "content": [{"text": prompt}]}],
+            )
+            status_code = getattr(response, "status_code", None)
+            if status_code and int(status_code) != 200:
+                raise RuntimeError(
+                    f"DashScope status={status_code}, code={getattr(response, 'code', '')}, "
+                    f"message={getattr(response, 'message', '')}"
+                )
+            content = response.output.choices[0].message.content
+            for item in content:
+                if isinstance(item, dict) and item.get("text"):
+                    return item["text"]
+            raise RuntimeError("DashScope response has no text content")
+        except Exception as exc:
+            LOGGER.error("DashScope native generation failed: %s", exc)
             return (
                 "模型 API 调用失败，以下是本地演示草稿。\n\n"
                 f"失败原因：{exc}\n\n"
@@ -85,22 +171,57 @@ class LLMClient:
 """
         return self.generate(prompt)
 
-    def embed_texts(self, texts):
+    def embed_texts(self, texts, batch_size=None, progress_callback=None, raise_on_error=False):
         if not self.embedding_api_key:
             return []
         embeddings = []
-        batch_size = 8
+        batch_size = max(1, int(batch_size or self.embedding_batch_size))
+        batch_size = min(20, batch_size)
+        total_batches = (len(texts) + batch_size - 1) // batch_size if texts else 0
         for start in range(0, len(texts), batch_size):
             batch = texts[start : start + batch_size]
-            batch_embeddings = self._embed_text_batch(batch)
+            try:
+                batch_embeddings = self._embed_text_batch_resilient(batch, raise_on_error)
+            except EmbeddingAPIError:
+                if raise_on_error:
+                    raise
+                batch_embeddings = []
             if len(batch_embeddings) == len(batch):
                 embeddings.extend(batch_embeddings)
             else:
+                message = (
+                    f"Embedding 返回数量不匹配：expected={len(batch)}, "
+                    f"actual={len(batch_embeddings)}, model={self.embedding_model}"
+                )
+                self.last_embedding_error = message
+                LOGGER.error(message)
+                if raise_on_error:
+                    raise EmbeddingAPIError(message)
                 embeddings.extend([None] * len(batch))
+            if progress_callback:
+                progress_callback(min(total_batches, start // batch_size + 1), total_batches)
         return embeddings
+
+    def _embed_text_batch_resilient(self, texts, raise_on_error=False):
+        try:
+            return self._embed_text_batch(texts)
+        except EmbeddingAPIError:
+            if len(texts) <= 1:
+                raise
+            midpoint = max(1, len(texts) // 2)
+            LOGGER.warning(
+                "Embedding batch failed; splitting batch %s into %s + %s",
+                len(texts),
+                midpoint,
+                len(texts) - midpoint,
+            )
+            left = self._embed_text_batch_resilient(texts[:midpoint], raise_on_error)
+            right = self._embed_text_batch_resilient(texts[midpoint:], raise_on_error)
+            return left + right
 
     def _embed_text_batch(self, texts):
         payload = {"model": self.embedding_model, "input": texts}
+        char_count = sum(len(text or "") for text in texts)
         req = urllib.request.Request(
             f"{self.embedding_base_url}/embeddings",
             data=json.dumps(payload).encode("utf-8"),
@@ -110,12 +231,120 @@ class LLMClient:
             },
             method="POST",
         )
+        for attempt in range(1, 3):
+            try:
+                with urllib.request.urlopen(req, timeout=90) as response:
+                    data = json.loads(response.read().decode("utf-8"))
+                return [item["embedding"] for item in data["data"]]
+            except http.client.IncompleteRead as exc:
+                message = (
+                    f"Embedding API 响应读取不完整：attempt={attempt}, "
+                    f"model={self.embedding_model}, url={self.embedding_base_url}/embeddings, "
+                    f"batch={len(texts)}, chars={char_count}, "
+                    f"read={len(exc.partial)}, expected_more={exc.expected}"
+                )
+                self.last_embedding_error = message
+                LOGGER.warning(message)
+                if attempt < 2:
+                    time.sleep(1)
+                    continue
+                raise EmbeddingAPIError(message) from exc
+            except urllib.error.HTTPError as exc:
+                try:
+                    body = exc.read().decode("utf-8", errors="replace")
+                except Exception:
+                    body = ""
+                message = (
+                    f"Embedding API HTTP {exc.code}: model={self.embedding_model}, "
+                    f"url={self.embedding_base_url}/embeddings, batch={len(texts)}, "
+                    f"chars={char_count}, body={body[:1200]}"
+                )
+                self.last_embedding_error = message
+                LOGGER.error(message)
+                raise EmbeddingAPIError(message) from exc
+            except (
+                urllib.error.URLError,
+                socket.timeout,
+                TimeoutError,
+                KeyError,
+                json.JSONDecodeError,
+            ) as exc:
+                message = (
+                    f"Embedding API 调用失败：attempt={attempt}, {type(exc).__name__}: {exc}; "
+                    f"model={self.embedding_model}, url={self.embedding_base_url}/embeddings, "
+                    f"batch={len(texts)}, chars={char_count}"
+                )
+                self.last_embedding_error = message
+                LOGGER.warning(message)
+                if attempt < 2:
+                    time.sleep(1)
+                    continue
+                raise EmbeddingAPIError(message) from exc
+
+    def rerank(self, query, candidates, top_n=5):
+        if not self.api_key or not self.rerank_enabled or not candidates:
+            return candidates[:top_n]
+        payload = []
+        for index, item in enumerate(candidates[:20], start=1):
+            payload.append(
+                {
+                    "index": index,
+                    "title": item.get("title", ""),
+                    "mode": item.get("mode", ""),
+                    "score": item.get("score", 0),
+                    "content": (item.get("content") or "")[:900],
+                }
+            )
+        prompt = f"""请根据用户问题，对候选 RAG 片段按“是否有助于回答问题”重新排序。
+
+要求：
+1. 只输出 JSON。
+2. ranked_indexes 里放候选 index，最相关的排最前。
+3. 最多返回 {top_n} 个 index。
+4. 不要新增候选之外的内容。
+
+【用户问题】
+{query}
+
+【候选片段】
+{json.dumps(payload, ensure_ascii=False, indent=2)}
+
+输出格式：
+{{"ranked_indexes": [1, 3, 2], "reason": "简短说明"}}
+"""
+        raw = self.generate(prompt)
         try:
-            with urllib.request.urlopen(req, timeout=90) as response:
-                data = json.loads(response.read().decode("utf-8"))
-            return [item["embedding"] for item in data["data"]]
-        except (urllib.error.URLError, KeyError, json.JSONDecodeError):
-            return []
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            start = raw.find("{")
+            end = raw.rfind("}")
+            data = {}
+            if start >= 0 and end > start:
+                try:
+                    data = json.loads(raw[start : end + 1])
+                except json.JSONDecodeError:
+                    data = {}
+        ranked = []
+        seen = set()
+        for value in data.get("ranked_indexes", []):
+            try:
+                idx = int(value) - 1
+            except (TypeError, ValueError):
+                continue
+            if 0 <= idx < len(candidates) and idx not in seen:
+                item = dict(candidates[idx])
+                item["rerank_rank"] = len(ranked) + 1
+                item["rerank_reason"] = data.get("reason", "")
+                ranked.append(item)
+                seen.add(idx)
+            if len(ranked) >= top_n:
+                break
+        for idx, item in enumerate(candidates):
+            if len(ranked) >= top_n:
+                break
+            if idx not in seen:
+                ranked.append(item)
+        return ranked[:top_n]
 
     def demo_answer(self, prompt):
         title = "这个问题背后，可能不是简单的“不够努力”。"

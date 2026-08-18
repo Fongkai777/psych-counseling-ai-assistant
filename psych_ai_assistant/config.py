@@ -14,13 +14,20 @@ def load_config(env_path: Path):
 
     for key in (
         "LLM_API_KEY",
+        "DASHSCOPE_API_KEY",
+        "LLM_PROVIDER",
         "LLM_BASE_URL",
         "LLM_MODEL",
         "LLM_TEMPERATURE",
+        "LLM_ENABLE_THINKING",
+        "RERANK_ENABLED",
+        "EMBEDDING_API_KEY",
+        "EMBEDDING_BASE_URL",
+        "EMBEDDING_MODEL",
+        "EMBEDDING_BATCH_SIZE",
         "APP_HOST",
         "APP_PORT",
     ):
         if os.environ.get(key):
             config[key] = os.environ[key]
     return config
-
