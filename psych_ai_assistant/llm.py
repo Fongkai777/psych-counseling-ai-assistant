@@ -8,6 +8,7 @@ import urllib.request
 
 
 LOGGER = logging.getLogger(__name__)
+MAX_EMBEDDING_INPUT_CHARS = 30000
 
 
 class EmbeddingAPIError(Exception):
@@ -178,6 +179,7 @@ class LLMClient:
     def embed_texts(self, texts, batch_size=None, progress_callback=None, raise_on_error=False):
         if not self.embedding_api_key:
             return []
+        texts = [self._fit_embedding_input(text) for text in texts]
         embeddings = []
         batch_size = max(1, int(batch_size or self.embedding_batch_size))
         batch_size = min(20, batch_size)
@@ -205,6 +207,29 @@ class LLMClient:
             if progress_callback:
                 progress_callback(min(total_batches, start // batch_size + 1), total_batches)
         return embeddings
+
+    def _fit_embedding_input(self, text):
+        text = text or ""
+        if len(text) <= MAX_EMBEDDING_INPUT_CHARS:
+            return text
+        head_size = MAX_EMBEDDING_INPUT_CHARS // 2
+        tail_size = MAX_EMBEDDING_INPUT_CHARS // 3
+        middle_size = MAX_EMBEDDING_INPUT_CHARS - head_size - tail_size - 80
+        middle_start = max(0, (len(text) - middle_size) // 2)
+        fitted = (
+            text[:head_size]
+            + "\n\n[... embedding input truncated: middle sample ...]\n\n"
+            + text[middle_start : middle_start + middle_size]
+            + "\n\n[... embedding input truncated: tail sample ...]\n\n"
+            + text[-tail_size:]
+        )
+        LOGGER.warning(
+            "Embedding input truncated from %s to %s chars for model=%s",
+            len(text),
+            len(fitted),
+            self.embedding_model,
+        )
+        return fitted[:MAX_EMBEDDING_INPUT_CHARS]
 
     def _embed_text_batch_resilient(self, texts, raise_on_error=False):
         try:
