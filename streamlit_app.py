@@ -2230,6 +2230,7 @@ if active_tab == "系统状态":
     st.write(f"Embedding 模式：`{model_status['embedding_mode']}`")
     st.write(f"Embedding 模型：`{model_status['embedding_model']}`")
     st.write(f"Embedding batch size：`{model_status.get('embedding_batch_size', 20)}`")
+    st.write(f"Embedding 单条输入上限：`{model_status.get('embedding_max_input_chars', 7800)}` 字")
     st.write(f"Rerank 模型：`{model_status.get('rerank_model', 'qwen3-vl-rerank')}`")
     st.write(
         f"API 重排：`{model_status.get('rerank_mode', 'off') if st.session_state.get('retrieval_use_rerank') else 'off'}`"

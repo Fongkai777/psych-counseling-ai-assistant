@@ -8,7 +8,7 @@ import urllib.request
 
 
 LOGGER = logging.getLogger(__name__)
-MAX_EMBEDDING_INPUT_CHARS = 30000
+DEFAULT_MAX_EMBEDDING_INPUT_CHARS = 7800
 
 
 class EmbeddingAPIError(Exception):
@@ -35,6 +35,10 @@ class LLMClient:
         ).rstrip("/")
         self.embedding_model = config.get("EMBEDDING_MODEL") or "text-embedding-3-small"
         self.embedding_batch_size = max(1, min(20, int(config.get("EMBEDDING_BATCH_SIZE") or 5)))
+        self.embedding_max_input_chars = max(
+            1000,
+            min(30000, int(config.get("EMBEDDING_MAX_INPUT_CHARS") or DEFAULT_MAX_EMBEDDING_INPUT_CHARS)),
+        )
         self.rerank_enabled = str(config.get("RERANK_ENABLED", "")).lower() in {
             "1",
             "true",
@@ -52,6 +56,7 @@ class LLMClient:
             "embedding_mode": "api" if self.embedding_api_key else "local",
             "embedding_model": self.embedding_model,
             "embedding_batch_size": self.embedding_batch_size,
+            "embedding_max_input_chars": self.embedding_max_input_chars,
             "rerank_mode": "dashscope_api"
             if self.rerank_enabled and self.dashscope_api_key
             else "off",
@@ -210,11 +215,12 @@ class LLMClient:
 
     def _fit_embedding_input(self, text):
         text = text or ""
-        if len(text) <= MAX_EMBEDDING_INPUT_CHARS:
+        max_chars = self.embedding_max_input_chars
+        if len(text) <= max_chars:
             return text
-        head_size = MAX_EMBEDDING_INPUT_CHARS // 2
-        tail_size = MAX_EMBEDDING_INPUT_CHARS // 3
-        middle_size = MAX_EMBEDDING_INPUT_CHARS - head_size - tail_size - 80
+        head_size = max_chars // 2
+        tail_size = max_chars // 3
+        middle_size = max_chars - head_size - tail_size - 80
         middle_start = max(0, (len(text) - middle_size) // 2)
         fitted = (
             text[:head_size]
@@ -229,7 +235,7 @@ class LLMClient:
             len(fitted),
             self.embedding_model,
         )
-        return fitted[:MAX_EMBEDDING_INPUT_CHARS]
+        return fitted[:max_chars]
 
     def _embed_text_batch_resilient(self, texts, raise_on_error=False):
         try:
