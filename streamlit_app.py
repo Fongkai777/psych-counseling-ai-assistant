@@ -8,8 +8,10 @@ import streamlit as st
 from psych_ai_assistant.config import load_config
 from psych_ai_assistant.db import Database
 from psych_ai_assistant.document_loader import extract_uploaded_text
+from psych_ai_assistant.expression_retrieval import ExpressionRetriever
 from psych_ai_assistant.feedback import analyze_edit
 from psych_ai_assistant.llm import LLMClient
+from psych_ai_assistant.llamaindex_retrieval import LlamaIndexRetriever
 from psych_ai_assistant.prompts import (
     build_answer_prompt,
     build_intent_prompt,
@@ -20,7 +22,6 @@ from psych_ai_assistant.prompts import (
 from psych_ai_assistant.retrieval import (
     INDEX_CHUNK_OVERLAP,
     INDEX_CHUNK_SIZE,
-    Retriever,
     build_hierarchy_items,
     build_chunk_items,
     build_sentence_window_items,
@@ -33,6 +34,8 @@ ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / "data" / "assistant.sqlite3"
 LOG_PATH = ROOT / "logs" / "app.log"
 STYLE_PROFILE_PATH = ROOT / "data" / "style_voice_profile.md"
+GOLDEN_SENTENCE_PATH = ROOT / "data" / "golden_sentence_library.md"
+EXPRESSION_CACHE_PATH = ROOT / "data" / "expression_snippet_embeddings.json"
 LOG_PATH.parent.mkdir(exist_ok=True)
 logging.basicConfig(
     filename=LOG_PATH,
@@ -43,10 +46,7 @@ RECOMMENDED_RAG_SETTINGS = {
     "rag_chunk_size": 1800,
     "rag_chunk_overlap": 240,
     "rag_embedding_batch_size": 5,
-    "rag_build_summary_index": True,
-    "rag_build_sentence_index": True,
     "rag_sentence_window_size": 3,
-    "rag_build_hierarchy_index": True,
     "retrieval_use_summary_index": True,
     "retrieval_summary_limit": 6,
     "retrieval_limit": 5,
@@ -54,6 +54,15 @@ RECOMMENDED_RAG_SETTINGS = {
     "retrieval_min_semantic_score": 0.50,
     "retrieval_min_lexical_score": 0.08,
     "retrieval_use_rerank": True,
+}
+RECOMMENDED_INDEX_SETTINGS = {
+    key: RECOMMENDED_RAG_SETTINGS[key]
+    for key in (
+        "rag_chunk_size",
+        "rag_chunk_overlap",
+        "rag_embedding_batch_size",
+        "rag_sentence_window_size",
+    )
 }
 
 
@@ -64,7 +73,15 @@ def services():
     client = LLMClient(config)
     return {
         "db": database,
-        "retriever": Retriever(database, client),
+        "retriever": LlamaIndexRetriever(
+            database,
+            client,
+            storage_dir=ROOT / "data" / "llamaindex_storage",
+        ),
+        "expression_retriever": ExpressionRetriever(
+            GOLDEN_SENTENCE_PATH,
+            cache_path=EXPRESSION_CACHE_PATH,
+        ),
         "llm": client,
     }
 
@@ -92,9 +109,10 @@ def seed_if_empty(db):
 svc = services()
 db = svc["db"]
 retriever = svc["retriever"]
+expression_retriever = svc["expression_retriever"]
 llm = svc["llm"]
 
-st.set_page_config(page_title="心理内容 AI 运营助手", layout="wide")
+st.set_page_config(page_title="Psych Counseling Answer Assistant", layout="wide")
 
 st.markdown(
     """
@@ -157,6 +175,8 @@ def init_state():
         "retrieval_use_summary_index": db.get_setting("retrieval_use_summary_index", "1")
         == "1",
         "retrieval_summary_limit": int(db.get_setting("retrieval_summary_limit", "6")),
+        "retrieval_folder_filter": db.get_setting("retrieval_folder_filter", "全部"),
+        "retrieval_source_filter": db.get_setting("retrieval_source_filter", "全部"),
         "retrieval_mode": db.get_setting("retrieval_mode", "hybrid"),
         "sentence_window_size": int(db.get_setting("sentence_window_size", "2")),
         "auto_merge_group_size": int(db.get_setting("auto_merge_group_size", "3")),
@@ -188,6 +208,9 @@ def init_state():
         "last_revision_memory_count": 0,
         "last_rag_eval": {},
         "last_rag_eval_prompt": "",
+        "last_expression_emotion_summary": "",
+        "last_expression_candidates": [],
+        "last_expression_matches": [],
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -254,7 +277,9 @@ def select_question(question_id):
     st.session_state.last_revision_memory_count = 0
     st.session_state.last_rag_eval = {}
     st.session_state.last_rag_eval_prompt = ""
-    st.session_state.last_rag_eval_prompt = ""
+    st.session_state.last_expression_emotion_summary = ""
+    st.session_state.last_expression_candidates = []
+    st.session_state.last_expression_matches = []
 
 
 def restore_answer_workspace(question):
@@ -360,6 +385,8 @@ def retrieval_settings():
         ),
         "use_summary_index": bool(st.session_state.get("retrieval_use_summary_index", True)),
         "summary_limit": int(st.session_state.get("retrieval_summary_limit", 6)),
+        "folder_filter": st.session_state.get("retrieval_folder_filter", "全部"),
+        "source_filter": st.session_state.get("retrieval_source_filter", "全部"),
         "retrieval_mode": st.session_state.get("retrieval_mode", "hybrid"),
         "sentence_window_size": int(st.session_state.get("sentence_window_size", 2)),
         "auto_merge_group_size": int(st.session_state.get("auto_merge_group_size", 3)),
@@ -376,20 +403,20 @@ def rag_index_settings():
     chunk_size = max(100, min(4000, chunk_size))
     chunk_overlap = max(0, min(chunk_overlap, chunk_size - 1))
     embedding_batch_size = max(1, min(20, embedding_batch_size))
-    build_summary_index = bool(st.session_state.get("rag_build_summary_index", True))
-    build_sentence_index = bool(st.session_state.get("rag_build_sentence_index", True))
+    build_summary_index = True
+    build_sentence_index = True
     sentence_window_size = int(st.session_state.get("rag_sentence_window_size", 3))
     sentence_window_size = max(0, min(8, sentence_window_size))
-    build_hierarchy_index = bool(st.session_state.get("rag_build_hierarchy_index", True))
+    build_hierarchy_index = True
     hierarchy_sizes = [chunk_size, chunk_size * 3, chunk_size * 9]
     hierarchy_chunk_sizes = ",".join(str(size) for size in hierarchy_sizes)
     db.set_setting("rag_chunk_size", str(chunk_size))
     db.set_setting("rag_chunk_overlap", str(chunk_overlap))
     db.set_setting("rag_embedding_batch_size", str(embedding_batch_size))
-    db.set_setting("rag_build_summary_index", "1" if build_summary_index else "0")
-    db.set_setting("rag_build_sentence_index", "1" if build_sentence_index else "0")
+    db.set_setting("rag_build_summary_index", "1")
+    db.set_setting("rag_build_sentence_index", "1")
     db.set_setting("rag_sentence_window_size", str(sentence_window_size))
-    db.set_setting("rag_build_hierarchy_index", "1" if build_hierarchy_index else "0")
+    db.set_setting("rag_build_hierarchy_index", "1")
     db.set_setting("rag_hierarchy_chunk_sizes", hierarchy_chunk_sizes)
     llm.embedding_batch_size = embedding_batch_size
     return (
@@ -410,6 +437,13 @@ def apply_recommended_rag_settings():
             db.set_setting(key, "1" if value else "0")
         else:
             db.set_setting(key, str(value))
+
+
+def apply_recommended_index_settings():
+    for key, value in RECOMMENDED_INDEX_SETTINGS.items():
+        st.session_state[key] = value
+        db.set_setting(key, str(value))
+    db.set_setting("rag_index_recommended_initialized", "1")
 
 
 def set_retrieval_preset(limit, min_score, min_semantic_score, min_lexical_score):
@@ -524,6 +558,39 @@ def render_context(results):
             if item.get("rerank_reason"):
                 st.caption(f"重排理由：{item['rerank_reason'][:260]}")
             st.write(item["content"])
+
+
+def render_expression_matches(emotion_summary, matches, candidates=None):
+    if not emotion_summary and not matches:
+        st.caption("生成回答后，这里会显示本题匹配到的个人表达片段。")
+        return
+    if emotion_summary:
+        with st.expander("本题情绪摘要", expanded=False):
+            st.write(emotion_summary)
+    if matches:
+        st.markdown("**本题选用的个人表达片段**")
+        for item in matches:
+            with st.expander(
+                f"{item.get('id', '')}. {item.get('title', '')} · {item.get('reuse_mode', '')}",
+                expanded=False,
+            ):
+                detail = []
+                if item.get("score") is not None:
+                    detail.append(f"情绪召回 {item.get('score')}")
+                if item.get("themes"):
+                    detail.append(item["themes"])
+                st.caption(" · ".join(detail))
+                if item.get("picker_reason"):
+                    st.caption(f"选择理由：{item['picker_reason']}")
+                st.write(item.get("text", ""))
+    else:
+        st.caption("本次没有选用个人表达片段，避免硬塞。")
+    if candidates:
+        with st.expander("候选个人表达片段 Top 8", expanded=False):
+            for item in candidates:
+                st.caption(
+                    f"{item.get('id')}. {item.get('title')} · score {item.get('score', '')} · {item.get('themes', '')}"
+                )
 
 
 def parse_json_object(text):
@@ -650,11 +717,11 @@ def render_rag_triad(eval_result, show_empty=False):
 
 def render_retrieval_config_panel():
     with st.expander("检索配置", expanded=True):
-        st.markdown("**1. 召回范围：先找哪些文档**")
+        st.markdown("**1. 文档路由：先筛哪些资料**")
         st.checkbox(
-            "先用 Summary Index 筛文档",
+            "启用 LlamaIndex Summary Route",
             key="retrieval_use_summary_index",
-            help="开启后先从文档摘要里找候选资料，再进入这些资料的 chunk/句子/层级索引检索。",
+            help="开启后先用每篇资料的 summary node 做 Vector + BM25 + QueryFusion，筛出候选文档，再进入片段检索。",
         )
         st.number_input(
             "候选文档数",
@@ -662,7 +729,31 @@ def render_retrieval_config_panel():
             max_value=20,
             step=1,
             key="retrieval_summary_limit",
-            help="摘要索引先保留多少份候选文档。",
+            help="Summary Route 先保留多少份候选文档。资料较多时建议 4-8。",
+        )
+        folders = ["全部"] + [folder for folder in db.list_document_folders() if folder != "全部"]
+        current_folder = st.session_state.get("retrieval_folder_filter", "全部")
+        if current_folder not in folders:
+            current_folder = "全部"
+            st.session_state.retrieval_folder_filter = "全部"
+        st.selectbox(
+            "检索文件夹",
+            folders,
+            index=folders.index(current_folder),
+            key="retrieval_folder_filter",
+            help="只在指定文件夹中做文档路由和片段召回。适合把书、旧回答、专题资料分开测试。",
+        )
+        source_options = ["全部", "上传文件", "我的旧回答"]
+        current_source = st.session_state.get("retrieval_source_filter", "全部")
+        if current_source not in source_options:
+            current_source = "全部"
+            st.session_state.retrieval_source_filter = "全部"
+        st.selectbox(
+            "资料来源",
+            source_options,
+            index=source_options.index(current_source),
+            key="retrieval_source_filter",
+            help="上传文件指普通知识库资料；我的旧回答指保存终稿后自动入库的 past_answer 资料。",
         )
         db.set_setting(
             "retrieval_use_summary_index",
@@ -672,63 +763,53 @@ def render_retrieval_config_panel():
             "retrieval_summary_limit",
             str(int(st.session_state.retrieval_summary_limit)),
         )
+        db.set_setting("retrieval_folder_filter", st.session_state.retrieval_folder_filter)
+        db.set_setting("retrieval_source_filter", st.session_state.retrieval_source_filter)
 
         st.divider()
-        st.markdown("**2. 检索策略：怎么找片段**")
+        st.markdown("**2. 片段召回：用哪种 LlamaIndex 检索器**")
         mode_options = {
-            "标准混合检索": "hybrid",
+            "Vector + BM25 + QueryFusion": "hybrid",
             "Sentence Window": "sentence_window",
             "Auto Merging": "auto_merging",
         }
         current_mode = st.session_state.get("retrieval_mode", "hybrid")
         current_mode_label = next(
             (label for label, value in mode_options.items() if value == current_mode),
-            "标准混合检索",
+            "Vector + BM25 + QueryFusion",
         )
         mode_label = st.selectbox(
             "检索方式",
             list(mode_options.keys()),
             index=list(mode_options.keys()).index(current_mode_label),
             key="retrieval_mode_label",
-            help="标准混合检索走 chunk；Sentence Window 走句子窗口；Auto Merging 走层级合并。",
+            help="三种方式都由 LlamaIndex 执行：基础模式做向量+BM25融合；Sentence Window 返回命中句前后文；Auto Merging 返回上层合并上下文。",
         )
         st.session_state.retrieval_mode = mode_options[mode_label]
         db.set_setting("retrieval_mode", st.session_state.retrieval_mode)
         if st.session_state.retrieval_mode == "sentence_window":
-            st.caption("当前模式会优先使用入库时生成的 Sentence Window 索引。")
+            st.caption("当前模式：SentenceWindowNodeParser 检索句子节点，再用 MetadataReplacementPostProcessor 替换为窗口上下文。")
             st.number_input(
-                "旧索引回退窗口",
+                "窗口前后句数",
                 min_value=0,
                 max_value=8,
                 step=1,
                 key="sentence_window_size",
-                help="旧资料没建 sentence index 时，才从普通 chunk 中临时取前后句。",
+                help="命中句子前后各带多少句。越大上下文越完整，但会占更多 prompt 长度。",
             )
             db.set_setting(
                 "sentence_window_size",
                 str(int(st.session_state.sentence_window_size)),
             )
         if st.session_state.retrieval_mode == "auto_merging":
-            st.caption("当前模式会优先使用入库时生成的 hierarchy node 索引。")
-            st.number_input(
-                "旧索引回退组大小",
-                min_value=2,
-                max_value=8,
-                step=1,
-                key="auto_merge_group_size",
-                help="旧资料没建 hierarchy index 时，才按连续 chunk 分组回退。",
-            )
+            st.caption("当前模式：HierarchicalNodeParser 建 child/parent/grandparent，AutoMergingRetriever 在多个 child 命中时返回 parent。")
             st.slider(
                 "合并触发比例",
                 min_value=0.1,
                 max_value=1.0,
                 step=0.05,
                 key="auto_merge_threshold",
-                help="同一 parent 下命中的 child 比例达到这个值，就返回 parent。",
-            )
-            db.set_setting(
-                "auto_merge_group_size",
-                str(int(st.session_state.auto_merge_group_size)),
+                help="同一 parent 下命中的 child 比例超过这个值，就合并返回 parent。越低越容易返回长上下文。",
             )
             db.set_setting(
                 "auto_merge_threshold",
@@ -736,7 +817,7 @@ def render_retrieval_config_panel():
             )
 
         st.divider()
-        st.markdown("**3. 过滤与重排：留下哪些片段**")
+        st.markdown("**3. 过滤：保留哪些候选 node**")
         preset_col1, preset_col2, preset_col3 = st.columns(3)
         with preset_col1:
             if st.button("宽松", use_container_width=True, key="retrieval_preset_loose"):
@@ -753,37 +834,43 @@ def render_retrieval_config_panel():
             max_value=12,
             step=1,
             key="retrieval_limit",
-            help="最多返回多少条检索片段。阈值过滤后可能少于这个数量。",
+            help="最终最多返回多少条 LlamaIndex node。阈值过滤后可能少于这个数量。",
         )
         st.number_input(
-            "关键词阈值",
+            "BM25 阈值",
             min_value=0.0,
             max_value=1.0,
             step=0.01,
             format="%.2f",
             key="retrieval_min_lexical_score",
-            help="本地关键词相似度最低分。适合控制是否命中关键概念。",
+            help="LlamaIndex BM25Retriever 的归一化关键词分数阈值。适合控制术语、书名、概念名命中。",
         )
         st.slider(
-            "相关度阈值",
+            "Fusion 阈值",
             min_value=0.0,
             max_value=1.0,
             step=0.01,
             key="retrieval_min_score",
-            help="综合排序分的最低要求。建议先用 0.20 左右；如果结果太杂，再逐步拉高到 0.35。",
+            help="QueryFusionRetriever / AutoMergingRetriever 返回综合分的最低要求。建议先从 0 或 0.20 开始。",
         )
         st.slider(
-            "Embedding 阈值",
+            "Vector 阈值",
             min_value=0.0,
             max_value=1.0,
             step=0.01,
             key="retrieval_min_semantic_score",
-            help="向量相似度最低分。片段满足 embedding 阈值或关键词阈值任一条件，就会被保留。",
+            help="VectorStoreIndex 的归一化向量分数阈值。node 满足 Vector 或 BM25 任一阈值，就会被保留。",
         )
+
+        st.divider()
+        st.markdown("**4. 重排：是否让模型再排序**")
         st.checkbox(
-            "API 重排候选片段",
+            "启用千问 Rerank",
             key="retrieval_use_rerank",
-            help="先召回更多候选，再调用当前大模型按问题相关性重排。会额外消耗一次模型调用。",
+            help="对候选 node 调用 DashScope text-rerank 接口，优先使用 qwen3-vl-rerank。失败时会回退到 LlamaIndex LLMRerank。",
+        )
+        st.caption(
+            "当前链路：Metadata Filter → Summary Route → 片段召回 → 阈值过滤 → Rerank → 返回 Top K。"
         )
         db.set_setting(
             "retrieval_use_rerank",
@@ -910,6 +997,7 @@ def store_document(
     skip_if_source_exists=False,
     status_callback=None,
     cancelable=False,
+    rebuild_index=True,
 ):
     if skip_if_source_exists and db.document_exists_by_source(source):
         return None
@@ -917,11 +1005,32 @@ def store_document(
     document = db.add_document(title=title, source=source, content=content, folder=folder)
     document["content"] = content
     try:
-        index_document_with_settings(document, settings, status_callback, cancelable=cancelable)
+        if rebuild_index:
+            rebuild_llamaindex_rag_index(status_callback=status_callback, cancelable=cancelable)
+        elif hasattr(retriever, "clear_storage"):
+            retriever.clear_storage()
     except RagTaskCancelled:
         db.delete_document(document["id"])
         raise
     return document
+
+
+def rebuild_llamaindex_rag_index(status_callback=None, cancelable=False):
+    if cancelable:
+        check_rag_task_cancelled()
+
+    def progress(done, total, step):
+        if cancelable:
+            check_rag_task_cancelled()
+        if status_callback:
+            try:
+                status_callback(done, total, step)
+            except TypeError:
+                status_callback(f"LlamaIndex · {step} ({done}/{total})")
+
+    if hasattr(retriever, "rebuild_all"):
+        return retriever.rebuild_all(progress_callback=progress)
+    return None
 
 
 def index_document_with_settings(document, settings, status_callback=None, cancelable=False):
@@ -1021,19 +1130,25 @@ def index_document_with_settings(document, settings, status_callback=None, cance
 
 
 def rebuild_rag_index(progress_callback=None):
-    settings = rag_index_settings()
     documents = db.get_documents()
     total = len(documents)
-    for index, document in enumerate(documents, start=1):
-        check_rag_task_cancelled()
-        def step_callback(step):
-            check_rag_task_cancelled()
-            if progress_callback:
-                progress_callback(index, total, document, step)
+    check_rag_task_cancelled()
 
-        index_document_with_settings(document, settings, step_callback, cancelable=True)
+    def step_callback(index, total_steps=None, step=None):
+        check_rag_task_cancelled()
+        if step is None:
+            step = str(index)
+            index = 1
+            total_steps = 1
         if progress_callback:
-            progress_callback(index, total, document, "完成")
+            progress_callback(
+                index,
+                total_steps,
+                {"title": "LlamaIndex 全库索引", "content": ""},
+                step,
+            )
+
+    rebuild_llamaindex_rag_index(step_callback, cancelable=True)
     return total
 
 
@@ -1076,14 +1191,17 @@ def format_bytes(size):
 
 
 def render_rag_index_config():
-    with st.expander("入库索引配置", expanded=False):
+    if db.get_setting("rag_index_recommended_initialized", "0") != "1":
+        apply_recommended_index_settings()
+
+    with st.expander("入库索引配置", expanded=True):
         st.caption(
-            "这里决定资料入库时预先生成哪些索引；回答工作台只是在检索阶段选择使用哪一种。"
+            "这里决定 LlamaIndex 入库索引的构建参数；回答工作台会按检索模式选择对应索引。"
         )
         rec_col, note_col = st.columns([0.32, 0.68])
         with rec_col:
             if st.button("使用推荐配置", use_container_width=True):
-                apply_recommended_rag_settings()
+                apply_recommended_index_settings()
                 st.success("已填入推荐配置。旧资料需要重建索引。")
                 rerun()
         with note_col:
@@ -1098,8 +1216,8 @@ def render_rag_index_config():
             st.session_state.rag_chunk_overlap = max(0, current_chunk_size - 1)
 
         with st.container(border=True):
-            st.markdown("**1. Vector Index：原文片段索引**")
-            st.caption("最基础的 RAG 索引。把资料切成 chunk，给每个 chunk 生成 embedding。")
+            st.markdown("**1. LlamaIndex VectorStore：原文片段索引**")
+            st.caption("用 LlamaIndex SentenceSplitter 切 chunk，再建立 VectorStoreIndex。")
             st.number_input(
                 "Chunk 长度",
                 min_value=300,
@@ -1126,23 +1244,13 @@ def render_rag_index_config():
             )
 
         with st.container(border=True):
-            st.markdown("**2. Summary Index：文档路由索引**")
-            st.caption("先用每篇资料的摘要筛文档，再进入具体片段检索。它不是最终回答依据。")
-            st.checkbox(
-                "生成文档摘要索引",
-                key="rag_build_summary_index",
-                help="每篇资料额外生成一段摘要和摘要向量，用来先判断应该检索哪份文档。",
-            )
-            st.caption("推荐：开启。摘要策略跟随当前 chunk：≤3 块本地摘要，4-10 块模型全文摘要，>10 块分段摘要后合并。")
+            st.markdown("**2. LlamaIndex Summary Route：文档路由索引**")
+            st.caption("先为每篇资料建立摘要 node，再用 LlamaIndex 向量检索 + BM25 fusion 筛候选文档。")
+            st.caption("当前固定生成。这里的摘要 route 是轻量抽取式摘要 node，不再写入旧 SQLite summary 表。")
 
         with st.container(border=True):
-            st.markdown("**3A. Sentence Window：chunk 召回 + 句子窗口**")
-            st.caption("入库时按当前 chunk 生成 embedding；检索命中 chunk 后，再在 chunk 内定位相关句子并返回前后窗口。")
-            st.checkbox(
-                "生成 Sentence Window 索引",
-                key="rag_build_sentence_index",
-                help="入库时复用当前 chunk 粒度建索引；检索时在命中的 chunk 里抽取句子窗口，速度比每句 embedding 快很多。",
-            )
+            st.markdown("**3A. LlamaIndex Sentence Window**")
+            st.caption("用 SentenceWindowNodeParser 建小句节点，检索命中后用 MetadataReplacementPostProcessor 返回窗口上下文。")
             st.number_input(
                 "窗口前后句数",
                 min_value=0,
@@ -1153,19 +1261,14 @@ def render_rag_index_config():
             )
 
         with st.container(border=True):
-            st.markdown("**3B. Auto Merging：层级合并索引**")
+            st.markdown("**3B. LlamaIndex Auto Merging**")
             auto_sizes = [
                 int(st.session_state.rag_chunk_size),
                 int(st.session_state.rag_chunk_size) * 3,
                 int(st.session_state.rag_chunk_size) * 9,
             ]
             st.caption(
-                "检索时先命中当前 chunk，多个 chunk 命中同一上层区域时返回更完整上下文。"
-            )
-            st.checkbox(
-                "生成 Auto Merging 层级索引",
-                key="rag_build_hierarchy_index",
-                help="入库时按当前 chunk 自动构建 child -> parent -> grandparent；检索时命中多个 child 后合并 parent。",
+                "用 HierarchicalNodeParser 建父子层级，再由 AutoMergingRetriever 合并更完整上下文。"
             )
             st.caption(
                 f"当前自动层级：{auto_sizes[0]},{auto_sizes[1]},{auto_sizes[2]}。"
@@ -1196,7 +1299,7 @@ def render_rag_index_config():
                 st.warning("已请求暂停。正在进行中的 API 调用会在返回或超时后停止。")
         with task_col:
             start_rebuild = st.button(
-                "按当前参数重建全部 RAG 索引",
+                "按当前参数重建全部 LlamaIndex RAG 索引",
                 use_container_width=True,
             )
         if start_rebuild:
@@ -1218,8 +1321,8 @@ def render_rag_index_config():
             try:
                 total = rebuild_rag_index(show_rebuild_progress)
                 progress_bar.progress(1.0)
-                status_box.success(f"RAG 索引已重建完成，共处理 {total} 份资料。")
-                detail_box.caption("已生成 Vector、Summary、Sentence Window 和 Auto Merging 相关索引。")
+                status_box.success(f"LlamaIndex RAG 索引已重建完成，共处理 {total} 份资料。")
+                detail_box.caption("已生成 Summary Route、Vector+BM25 Fusion、Sentence Window 和 Auto Merging 索引。")
             except RagTaskCancelled:
                 status_box.warning("RAG 索引重建已暂停。已经完成的文件会保留，未完成的文件下次可重新重建。")
                 detail_box.caption("再次点击重建时，会自动清除暂停标记并从头按当前参数重建。")
@@ -1230,11 +1333,11 @@ llm.embedding_batch_size = max(
     1, min(20, int(st.session_state.get("rag_embedding_batch_size", llm.embedding_batch_size)))
 )
 
-st.title("心理内容 AI 运营助手")
+st.title("Psych Counseling Answer Assistant")
 model_status = llm.status()
 st.caption(
     f"本机工作台 · 回答模型：{model_status['mode']} / {model_status['model']} · "
-    f"RAG：{model_status['embedding_mode']} / {model_status['embedding_model']}"
+    f"RAG：LlamaIndex Summary/Vector/BM25/Fusion / {model_status['embedding_model']}"
 )
 
 MAIN_TABS = ["选题池", "RAG 维护", "回答工作台", "回答管理", "系统状态"]
@@ -1435,6 +1538,7 @@ if active_tab == "RAG 维护":
                                 folder=current_folder,
                                 status_callback=show_import_step,
                                 cancelable=True,
+                                rebuild_index=False,
                             )
                             imported += 1
                             import_progress.progress(upload_index / total_uploads)
@@ -1451,6 +1555,21 @@ if active_tab == "RAG 维护":
                     if not cancelled:
                         import_progress.progress(1.0)
                     if imported and not cancelled:
+                        def show_batch_index_step(step):
+                            check_rag_task_cancelled()
+                            import_status.info(f"正在重建 LlamaIndex 全库索引：{step}")
+                            import_detail.caption(
+                                f"本次新增 {imported} 个文件；跳过 {skipped} 个同名文件。"
+                            )
+
+                        try:
+                            rebuild_llamaindex_rag_index(
+                                status_callback=show_batch_index_step,
+                                cancelable=True,
+                            )
+                        except RagTaskCancelled:
+                            import_status.warning("导入已完成，但索引重建被暂停。下次检索或重建时会继续生成 LlamaIndex 缓存。")
+                            rerun()
                         import_status.success(
                             f"导入完成：新增 {imported} 个文件，跳过 {skipped} 个同名文件。"
                         )
@@ -1513,7 +1632,7 @@ if active_tab == "RAG 维护":
                         if st.button("取消", key=f"cancel_move_doc_{doc['id']}", use_container_width=True):
                             st.session_state.rag_move_doc_id = None
                             rerun()
-                with st.expander("预览与 chunks"):
+                with st.expander("预览与历史索引表"):
                     full_doc = db.get_document(doc["id"])
                     content = (full_doc or {}).get("content", "")
                     st.text_area(
@@ -1545,7 +1664,7 @@ if active_tab == "RAG 维护":
                     leaf_nodes = sum(1 for node in hierarchy_nodes if node.get("level") == 0)
                     summary_status = "1 summary" if summaries else "无摘要索引"
                     st.caption(
-                        f"{len(chunks)} chunks · {embedded} chunk embeddings · {summary_status} · "
+                        f"历史兼容表：{len(chunks)} chunks · {embedded} chunk embeddings · {summary_status} · "
                         f"{len(sentence_nodes)} sentence nodes / {embedded_sentences} embeddings · "
                         f"{len(hierarchy_nodes)} hierarchy nodes / leaf {embedded_leaf_nodes}/{leaf_nodes}"
                     )
@@ -1780,6 +1899,22 @@ if active_tab == "回答工作台":
                                     ]
                                     if part.strip()
                                 )
+                            expression_result = expression_retriever.retrieve(
+                                question,
+                                guidance,
+                                llm,
+                                top_k=8,
+                                final_limit=3,
+                            )
+                            st.session_state.last_expression_emotion_summary = (
+                                expression_result.get("emotion_summary") or ""
+                            )
+                            st.session_state.last_expression_candidates = (
+                                expression_result.get("candidates") or []
+                            )
+                            st.session_state.last_expression_matches = (
+                                expression_result.get("selected") or []
+                            )
                             prompt = build_answer_prompt(
                                 question,
                                 st.session_state.context,
@@ -1787,6 +1922,7 @@ if active_tab == "回答工作台":
                                 global_prompt,
                                 style_profile,
                                 style_memories_for_prompt,
+                                st.session_state.last_expression_matches,
                             )
                             draft = llm.generate(prompt)
 
@@ -1842,6 +1978,12 @@ if active_tab == "回答工作台":
                                 label_visibility="collapsed",
                             )
                     render_deposited_prompt_memories()
+                    with st.expander("本题匹配到的个人表达片段", expanded=bool(st.session_state.get("last_expression_matches"))):
+                        render_expression_matches(
+                            st.session_state.get("last_expression_emotion_summary", ""),
+                            st.session_state.get("last_expression_matches", []),
+                            st.session_state.get("last_expression_candidates", []),
+                        )
 
                 with generation_editor_col:
                     render_answer_status()
@@ -1924,7 +2066,9 @@ if active_tab == "回答工作台":
                         st.success("终稿已保存，并已自动加入知识库。")
 
 if active_tab == "回答管理":
-    trace_tab, memory_tab, feedback_tab = st.tabs(["生成轨迹", "风格记忆", "人工编辑反馈"])
+    trace_tab, retrieval_trace_tab, memory_tab, feedback_tab = st.tabs(
+        ["生成轨迹", "检索 Trace", "风格记忆", "人工编辑反馈"]
+    )
 
     with trace_tab:
         st.subheader("生成轨迹与满意样本")
@@ -1998,6 +2142,40 @@ if active_tab == "回答管理":
                             label_visibility="collapsed",
                         )
 
+    with retrieval_trace_tab:
+        st.subheader("Retrieval Trace")
+        st.caption("这里记录每次检索的 Query、检索配置、Summary Route、候选 node 和最终返回片段，用来排查召回和重排问题。")
+        clear_col, hint_col = st.columns([0.24, 0.76])
+        with clear_col:
+            if st.button("清空 Trace", use_container_width=True, key="clear_retrieval_trace"):
+                db.clear_retrieval_traces()
+                st.success("已清空检索 Trace")
+                rerun()
+        with hint_col:
+            st.caption("Trace 只保存片段预览，不重复保存完整资料正文。")
+        traces = db.list_retrieval_traces(limit=30)
+        if not traces:
+            st.caption("点击“检索知识库”或生成回答后，这里会出现检索记录。")
+        for trace in traces:
+            with st.container(border=True):
+                st.markdown(f"**{trace['created_at']} · {trace.get('retrieval_mode') or 'retrieval'}**")
+                st.caption(f"耗时 {trace.get('elapsed_ms', 0)} ms")
+                with st.expander("Query 与配置", expanded=False):
+                    st.text_area(
+                        "Query",
+                        value=trace.get("query") or "",
+                        height=140,
+                        disabled=True,
+                        key=f"retrieval_trace_query_{trace['id']}",
+                    )
+                    st.json(trace.get("settings") or {})
+                with st.expander("Summary Route / 候选文档", expanded=False):
+                    st.json(trace.get("summary_routes") or [])
+                with st.expander("候选 node（过滤/重排前）", expanded=False):
+                    st.json(trace.get("candidates") or [])
+                with st.expander("最终返回片段", expanded=False):
+                    st.json(trace.get("final") or [])
+
     with memory_tab:
         st.subheader("长期风格记忆")
         memories = db.list_style_memories(limit=80)
@@ -2034,13 +2212,14 @@ if active_tab == "回答管理":
 if active_tab == "系统状态":
     st.subheader("数据库与 RAG 状态")
     stats = db.storage_stats()
+    llamaindex_stats = retriever.storage_stats() if hasattr(retriever, "storage_stats") else {}
     col1, col2, col3, col4, col5, col6 = st.columns(6)
     col1.metric("SQLite 文件", format_bytes(stats["db_size_bytes"]))
     col2.metric("知识库原文", f"{stats['document_chars']:,} 字")
-    col3.metric("RAG chunks", stats["tables"]["document_chunks"])
-    col4.metric("已向量化 chunks", stats["embedded_chunks"])
-    col5.metric("摘要索引", stats["tables"].get("document_summaries", 0))
-    col6.metric("句子节点", stats["tables"].get("sentence_nodes", 0))
+    col3.metric("资料数", stats["tables"].get("documents", 0))
+    col4.metric("LlamaIndex 缓存", format_bytes(llamaindex_stats.get("size_bytes", 0)))
+    col5.metric("LlamaIndex nodes", llamaindex_stats.get("node_count", 0))
+    col6.metric("历史 chunks", stats["tables"]["document_chunks"])
 
     st.subheader("表数据量")
     st.json(stats["tables"])
@@ -2051,8 +2230,9 @@ if active_tab == "系统状态":
     st.write(f"Embedding 模式：`{model_status['embedding_mode']}`")
     st.write(f"Embedding 模型：`{model_status['embedding_model']}`")
     st.write(f"Embedding batch size：`{model_status.get('embedding_batch_size', 20)}`")
+    st.write(f"Rerank 模型：`{model_status.get('rerank_model', 'qwen3-vl-rerank')}`")
     st.write(
-        f"API 重排：`{'开启' if st.session_state.get('retrieval_use_rerank') else '关闭'}`"
+        f"API 重排：`{model_status.get('rerank_mode', 'off') if st.session_state.get('retrieval_use_rerank') else 'off'}`"
     )
     st.caption("如果 embedding_mode 是 local，说明没有配置 embedding API，RAG 会自动使用本地词面检索。")
     if stats["embedding_models"]:
@@ -2064,18 +2244,25 @@ if active_tab == "系统状态":
         f"重叠 `{st.session_state.rag_chunk_overlap}` 字"
     )
     st.write(
-        f"摘要索引占用：`{stats['summary_chars']:,}` 字；"
-        f"已向量化摘要：`{stats['embedded_summaries']}`"
+        f"LlamaIndex RAG 缓存：`{format_bytes(llamaindex_stats.get('size_bytes', 0))}`；"
+        f"缓存节点：`{llamaindex_stats.get('node_count', 0)}`；"
+        f"路径：`{llamaindex_stats.get('path', '')}`"
     )
-    st.write(
-        f"Sentence Window：`{stats['tables'].get('sentence_nodes', 0)}` 个 chunk 窗口节点；"
-        f"已向量化：`{stats['embedded_sentences']}`"
+    stale_kinds = llamaindex_stats.get("stale_kinds") or []
+    if stale_kinds:
+        st.warning(
+            "以下 LlamaIndex 索引缺失或已过期，需要重建："
+            + "、".join(stale_kinds)
+        )
+    else:
+        st.success("LlamaIndex 索引状态正常。")
+    with st.expander("LlamaIndex 索引状态明细", expanded=False):
+        st.json(llamaindex_stats.get("indexes") or [])
+    st.caption(
+        "document_chunks / document_summaries / sentence_nodes / hierarchy_nodes 是历史兼容表；"
+        "当前回答检索以 LlamaIndex 缓存为准。"
     )
-    st.write(
-        f"Auto Merging 层级节点：`{stats['tables'].get('hierarchy_nodes', 0)}`；"
-        f"leaf 已向量化：`{stats['embedded_hierarchy_leaf']}`"
-    )
-    test_col, log_col = st.columns([0.35, 0.65])
+    test_col, clean_col, log_col = st.columns([0.28, 0.28, 0.44])
     with test_col:
         if st.button("测试 Embedding API", use_container_width=True):
             try:
@@ -2090,6 +2277,13 @@ if active_tab == "系统状态":
                     st.error("Embedding API 没有返回有效向量。")
             except Exception as exc:
                 st.error(f"Embedding API 测试失败：{exc}")
+    with clean_col:
+        if st.button("清理历史 RAG 表/缓存", use_container_width=True):
+            db.clear_legacy_rag_indexes(vacuum=True)
+            if hasattr(retriever, "clear_storage"):
+                retriever.clear_storage()
+            st.success("已清理历史 SQLite RAG 表和 LlamaIndex 缓存。请重新生成 LlamaIndex 索引。")
+            rerun()
     with log_col:
         st.caption(f"日志文件：`{LOG_PATH}`")
         if getattr(llm, "last_embedding_error", ""):
@@ -2097,67 +2291,21 @@ if active_tab == "系统状态":
 
     st.subheader("知识库占用明细")
     health = rag_health()
-    if (
-        health["missing_index"]
-        or health["missing_embeddings"]
-        or health["missing_summaries"]
-        or health["missing_summary_embeddings"]
-        or health["missing_sentence_index"]
-        or health["missing_sentence_embeddings"]
-        or health["missing_hierarchy_index"]
-    ):
-        st.warning(
-            f"需要关注：未生成索引 {len(health['missing_index'])} 份，"
-            f"未生成 chunk 向量 {len(health['missing_embeddings'])} 份，"
-            f"未生成摘要索引 {len(health['missing_summaries'])} 份，"
-            f"未生成摘要向量 {len(health['missing_summary_embeddings'])} 份，"
-            f"未生成句子索引 {len(health['missing_sentence_index'])} 份，"
-            f"句子向量不完整 {len(health['missing_sentence_embeddings'])} 份，"
-            f"未生成层级索引 {len(health['missing_hierarchy_index'])} 份。"
-        )
+    if stats["tables"].get("documents", 0) and not llamaindex_stats.get("node_count", 0):
+        st.warning("尚未生成 LlamaIndex RAG 缓存。点击「按当前参数重建全部 LlamaIndex RAG 索引」或首次检索时会生成。")
     else:
-        st.success("RAG 索引状态正常。")
+        st.success("LlamaIndex RAG 缓存状态正常。")
     for doc in health["documents"]:
         models = ", ".join(doc["embedding_models"]) if doc["embedding_models"] else "无"
         chunk_sizes = ", ".join(str(value) for value in doc["chunk_sizes"]) or "未知"
         chunk_overlaps = ", ".join(str(value) for value in doc["chunk_overlaps"]) or "未知"
-        summary_status = "有摘要索引" if doc["summary_indexed"] else "无摘要索引"
-        if doc["summary_indexed"] and not doc["summary_embedded"]:
-            summary_status += "，无摘要向量"
-        sentence_status = (
-            f"sentence {doc['sentence_embedded_count']}/{doc['sentence_node_count']}"
-            if doc["sentence_indexed"]
-            else "无句子索引"
-        )
-        hierarchy_status = (
-            f"hierarchy {doc['hierarchy_node_count']} nodes · leaf "
-            f"{doc['hierarchy_leaf_embedded_count']}/{doc['hierarchy_leaf_count']}"
-            if doc["hierarchy_indexed"]
-            else "无层级索引"
-        )
         with st.container(border=True):
             st.markdown(f"**{doc['title']}**")
             st.caption(
                 f"{doc.get('folder', '默认')} · {doc['source'] or '未注明来源'} · {doc['size']} 字 · "
-                f"{doc['chunk_count']} chunks · {doc['embedded_count']} embeddings · "
-                f"模型：{models} · chunk {chunk_sizes}/overlap {chunk_overlaps} · "
-                f"{summary_status} · {sentence_status} · {hierarchy_status}"
+                f"历史 chunks：{doc['chunk_count']} · 历史 embeddings：{doc['embedded_count']} · "
+                f"历史模型：{models} · 历史 chunk {chunk_sizes}/overlap {chunk_overlaps}"
             )
-            if doc["chunk_count"] and doc["embedded_count"] < doc["chunk_count"]:
-                st.error(
-                    f"Chunk 向量不完整：{doc['embedded_count']}/{doc['chunk_count']}。"
-                    "需要修复 embedding API 后重建索引。"
-                )
-            if doc["sentence_node_count"] and doc["sentence_embedded_count"] < doc["sentence_node_count"]:
-                st.warning(
-                    f"Sentence Window 向量不完整："
-                    f"{doc['sentence_embedded_count']}/{doc['sentence_node_count']}。"
-                )
-            if doc["hierarchy_leaf_count"] and doc["hierarchy_leaf_embedded_count"] < doc["hierarchy_leaf_count"]:
-                st.warning(
-                    f"Auto Merging leaf 向量不完整："
-                    f"{doc['hierarchy_leaf_embedded_count']}/{doc['hierarchy_leaf_count']}。"
-                )
 
     st.subheader("最近日志")
     if LOG_PATH.exists():

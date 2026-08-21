@@ -1,3 +1,10 @@
+import json
+
+
+def json_dumps(value):
+    return json.dumps(value, ensure_ascii=False, indent=2)
+
+
 def default_guardrails():
     return """你是一个心理类内容创作者的 AI 写作助手，不扮演治疗师，不做诊断。
 
@@ -49,6 +56,7 @@ def build_answer_prompt(
     global_prompt="",
     style_profile="",
     style_memories="",
+    expression_snippets=None,
 ):
     context_text = "\n\n".join(
         f"[{idx + 1}] 来源：{item['title']}，相关度：{item['score']}\n{item['content']}"
@@ -56,6 +64,7 @@ def build_answer_prompt(
     )
     if not context_text:
         context_text = "暂无匹配知识片段。请明确说明回答主要基于一般性理解，避免编造来源。"
+    expression_text = format_expression_snippets(expression_snippets or [])
 
     return f"""请为一个知乎心理类问题生成回答初稿。
 
@@ -86,6 +95,9 @@ def build_answer_prompt(
 【长期风格记忆】
 {style_memories or '无'}
 
+【本题匹配到的个人表达片段】
+{expression_text}
+
 【可引用知识片段】
 {context_text}
 
@@ -96,10 +108,98 @@ def build_answer_prompt(
 - 优先使用清楚的判断、概念解释、场景对比和具体行动。
 - 可以有温度，但表达要平实、克制、像一个人在认真说明问题。
 - 不编造研究者、年份、数据或个人经历；除非可引用知识片段中明确提供。
+- 个人表达片段只用于语气、意象和可复用表达。只有复用方式允许“直接引用”且与本题自然贴合时，才可以原句使用；否则只吸收表达方式，不要硬塞。
 
 【任务】
 请根据上述材料输出一版完整回答初稿。不要解释你遵守了哪些规则，直接输出正文。
 """
+
+
+def build_expression_emotion_prompt(question, intent=""):
+    return f"""请为下面这个知乎问题抽取“情绪结构摘要”，用于匹配个人表达片段。
+
+不要回答问题，只分析这个问题背后的情绪处境。
+
+【问题标题】
+{question['title']}
+
+【问题描述】
+{question.get('description') or '无'}
+
+【已有意图识别】
+{intent or '无'}
+
+请输出 120-220 字中文，覆盖：
+1. 读者可能处在什么情绪里。
+2. 这个问题背后的核心冲突是什么。
+3. 适合调用什么类型的个人表达。
+
+只输出摘要正文，不要输出编号。
+"""
+
+
+def build_quote_picker_prompt(question, intent, emotion_summary, candidates, final_limit=3):
+    payload = [
+        {
+            "id": item.get("id"),
+            "title": item.get("title"),
+            "themes": item.get("themes"),
+            "usage": item.get("usage"),
+            "reuse_mode": item.get("reuse_mode"),
+            "score": item.get("score"),
+            "text": item.get("text"),
+        }
+        for item in candidates
+    ]
+    return f"""请从候选个人表达片段中，为当前知乎回答选择最多 {final_limit} 条真正适合使用的片段。
+
+判断标准：
+1. 情绪结构是否贴合当前问题。
+2. 是否能让回答更像一个真实的人在思考，而不是硬塞漂亮句子。
+3. 是否适合直接引用；不适合直接引用时，也可以作为“改写/吸收语气”的素材。
+4. 如果都不合适，可以返回空数组。
+
+【问题标题】
+{question['title']}
+
+【问题描述】
+{question.get('description') or '无'}
+
+【意图识别】
+{intent or '无'}
+
+【本题情绪结构摘要】
+{emotion_summary or '无'}
+
+【候选表达片段】
+{json_dumps(payload)}
+
+请只输出 JSON，不要输出 Markdown，不要解释 JSON 之外的内容。
+
+格式：
+{{"selected_ids": ["001", "007"], "reason": "简短说明为什么选这些；如果没选，说明原因"}}
+"""
+
+
+def format_expression_snippets(snippets):
+    if not snippets:
+        return "无。不要为了模仿风格而硬编私人经历或硬塞金句。"
+    lines = []
+    for index, item in enumerate(snippets, start=1):
+        lines.append(
+            "\n".join(
+                part
+                for part in [
+                    f"[{index}] {item.get('title', '')}",
+                    f"主题：{item.get('themes', '')}",
+                    f"适用场景：{item.get('usage', '')}",
+                    f"复用方式：{item.get('reuse_mode', '')}",
+                    f"片段：{item.get('text', '')}",
+                ]
+                if part.strip()
+            )
+        )
+    return "\n\n".join(lines)
 
 
 def build_revision_feedback_memory_prompt(question, instruction, current_draft=""):

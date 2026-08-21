@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="520" viewBox="0 0 1100 520">
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .box { fill: #ffffff; stroke: #334155; stroke-width: 2; rx: 14; }
+      .blue { fill: #eff6ff; stroke: #2563eb; }
+      .red { fill: #fff1f2; stroke: #e11d48; }
+      .green { fill: #ecfdf5; stroke: #059669; }
+      .gray { fill: #f1f5f9; stroke: #64748b; }
+      .text { font-family: Arial, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #0f172a; font-size: 21px; }
+      .small { font-size: 16px; fill: #475569; }
+      .title { font-size: 28px; font-weight: 700; }
+      .formula { font-size: 19px; font-family: Arial, sans-serif; fill: #111827; }
+      .arrow { stroke: #334155; stroke-width: 2.3; fill: none; marker-end: url(#arrow); }
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#334155"/>
+    </marker>
+  </defs>
+  <rect class="bg" width="1100" height="520"/>
+
+  <text x="40" y="54" class="text title">片段如何被留下：过滤 + 打分 + 重排</text>
+
+  <rect x="45" y="115" width="275" height="130" class="box blue"/>
+  <text x="70" y="153" class="text" font-weight="700">候选片段</text>
+  <text x="70" y="185" class="text small">来自 chunk / sentence window / hierarchy node</text>
+  <text x="70" y="214" class="text small">每个片段会计算两类基础分</text>
+
+  <rect x="405" y="95" width="300" height="170" class="box gray"/>
+  <text x="430" y="135" class="text" font-weight="700">基础分</text>
+  <text x="430" y="170" class="text small">semantic_score：向量余弦相似度</text>
+  <text x="430" y="199" class="text small">lexical_score：关键词/字词相似度</text>
+  <text x="430" y="228" class="text small">exact_bonus：关键术语精确命中</text>
+
+  <rect x="790" y="95" width="260" height="170" class="box green"/>
+  <text x="815" y="135" class="text" font-weight="700">综合相关度</text>
+  <text x="815" y="170" class="formula">score = 0.55 × semantic</text>
+  <text x="865" y="199" class="formula">+ 0.35 × lexical</text>
+  <text x="865" y="228" class="formula">+ 0.10 × exact</text>
+
+  <rect x="175" y="335" width="345" height="120" class="box red"/>
+  <text x="200" y="375" class="text" font-weight="700">阈值过滤</text>
+  <text x="200" y="407" class="text small">(Embedding ≥ 阈值 或 关键词 ≥ 阈值)</text>
+  <text x="200" y="434" class="text small">并且 综合相关度 ≥ 相关度阈值</text>
+
+  <rect x="640" y="335" width="280" height="120" class="box blue"/>
+  <text x="665" y="375" class="text" font-weight="700">Top K / API 重排</text>
+  <text x="665" y="407" class="text small">先按综合分排序</text>
+  <text x="665" y="434" class="text small">可再由 LLM rerank 后返回</text>
+
+  <path d="M320 180 H405" class="arrow"/>
+  <path d="M705 180 H790" class="arrow"/>
+  <path d="M920 265 C900 320 560 305 430 335" class="arrow"/>
+  <path d="M520 395 H640" class="arrow"/>
+</svg>

@@ -150,6 +150,18 @@ class Database:
                     updated_at datetime default current_timestamp
                 );
 
+                create table if not exists retrieval_traces (
+                    id integer primary key autoincrement,
+                    query text not null,
+                    retrieval_mode text,
+                    settings_json text,
+                    summary_routes_json text,
+                    candidates_json text,
+                    final_json text,
+                    elapsed_ms integer,
+                    created_at datetime default current_timestamp
+                );
+
                 create table if not exists settings (
                     key text primary key,
                     value text not null
@@ -432,6 +444,81 @@ class Database:
                 conn.execute("delete from hierarchy_nodes where document_id = ?", (document_id,))
             conn.execute("delete from documents where source = ?", (source,))
 
+    def clear_legacy_rag_indexes(self, vacuum=False):
+        with self.connect() as conn:
+            for table in (
+                "document_chunks",
+                "document_summaries",
+                "sentence_nodes",
+                "hierarchy_nodes",
+            ):
+                conn.execute(f"delete from {table}")
+        if vacuum:
+            with self.connect() as conn:
+                conn.execute("vacuum")
+
+    def add_retrieval_trace(
+        self,
+        query,
+        retrieval_mode,
+        settings,
+        summary_routes,
+        candidates,
+        final,
+        elapsed_ms,
+    ):
+        with self.connect() as conn:
+            conn.execute(
+                """
+                insert into retrieval_traces (
+                    query, retrieval_mode, settings_json, summary_routes_json,
+                    candidates_json, final_json, elapsed_ms
+                )
+                values (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    query,
+                    retrieval_mode,
+                    json.dumps(settings or {}, ensure_ascii=False),
+                    json.dumps(summary_routes or [], ensure_ascii=False),
+                    json.dumps(candidates or [], ensure_ascii=False),
+                    json.dumps(final or [], ensure_ascii=False),
+                    int(elapsed_ms or 0),
+                ),
+            )
+
+    def list_retrieval_traces(self, limit=30):
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                select *
+                from retrieval_traces
+                order by id desc
+                limit ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        traces = []
+        for row in rows:
+            item = self.row_to_dict(row)
+            for key in (
+                "settings_json",
+                "summary_routes_json",
+                "candidates_json",
+                "final_json",
+            ):
+                parsed_key = key.removesuffix("_json")
+                try:
+                    item[parsed_key] = json.loads(item.get(key) or "{}")
+                except json.JSONDecodeError:
+                    item[parsed_key] = {} if key == "settings_json" else []
+            traces.append(item)
+        return traces
+
+    def clear_retrieval_traces(self):
+        with self.connect() as conn:
+            conn.execute("delete from retrieval_traces")
+
     def replace_document_chunks(self, document_id, chunk_items):
         with self.connect() as conn:
             conn.execute("delete from document_chunks where document_id = ?", (document_id,))
@@ -555,7 +642,8 @@ class Database:
             select
                 document_chunks.*,
                 documents.title,
-                documents.source
+                documents.source,
+                coalesce(documents.folder, '默认') as folder
             from document_chunks
             join documents on documents.id = document_chunks.document_id
         """
@@ -770,6 +858,7 @@ class Database:
                 "hierarchy_nodes",
                 "answers",
                 "generation_runs",
+                "retrieval_traces",
                 "style_memories",
                 "settings",
             ):

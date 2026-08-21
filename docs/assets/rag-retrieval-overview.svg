@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="560" viewBox="0 0 1100 560">
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .box { fill: #ffffff; stroke: #334155; stroke-width: 2; rx: 14; }
+      .soft { fill: #eef6ff; stroke: #2563eb; }
+      .green { fill: #ecfdf5; stroke: #059669; }
+      .orange { fill: #fff7ed; stroke: #ea580c; }
+      .purple { fill: #f5f3ff; stroke: #7c3aed; }
+      .text { font-family: Arial, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #0f172a; font-size: 22px; }
+      .small { font-size: 17px; fill: #475569; }
+      .title { font-size: 28px; font-weight: 700; }
+      .arrow { stroke: #334155; stroke-width: 2.4; fill: none; marker-end: url(#arrow); }
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#334155"/>
+    </marker>
+  </defs>
+  <rect class="bg" width="1100" height="560"/>
+
+  <text x="40" y="54" class="text title">RAG 检索配置的整体流程</text>
+  <text x="40" y="86" class="text small">问题 + 意图识别 + 人工检索意见，会组合成一次检索 Query。</text>
+
+  <rect x="40" y="125" width="230" height="110" class="box soft"/>
+  <text x="65" y="165" class="text" font-weight="700">检索 Query</text>
+  <text x="65" y="195" class="text small">问题标题 / 描述</text>
+  <text x="65" y="220" class="text small">意图识别 / 检索意见</text>
+
+  <rect x="340" y="105" width="270" height="150" class="box green"/>
+  <text x="365" y="145" class="text" font-weight="700">1. 召回范围</text>
+  <text x="365" y="178" class="text small">Summary Index 先筛文档</text>
+  <text x="365" y="205" class="text small">候选文档数决定搜索范围</text>
+  <text x="365" y="232" class="text small">例如：先保留 6 篇资料</text>
+
+  <rect x="690" y="105" width="330" height="150" class="box orange"/>
+  <text x="715" y="145" class="text" font-weight="700">2. 检索策略</text>
+  <text x="715" y="178" class="text small">标准混合检索：chunk 级召回</text>
+  <text x="715" y="205" class="text small">Sentence Window：命中句 + 前后文</text>
+  <text x="715" y="232" class="text small">Auto Merging：合并相邻/上层片段</text>
+
+  <rect x="200" y="335" width="310" height="145" class="box purple"/>
+  <text x="225" y="375" class="text" font-weight="700">3. 过滤与排序</text>
+  <text x="225" y="408" class="text small">Embedding 阈值 / 关键词阈值</text>
+  <text x="225" y="435" class="text small">相关度阈值 / Top K</text>
+  <text x="225" y="462" class="text small">决定哪些片段留下来</text>
+
+  <rect x="610" y="335" width="290" height="145" class="box soft"/>
+  <text x="635" y="375" class="text" font-weight="700">API 重排</text>
+  <text x="635" y="408" class="text small">让大模型重新判断</text>
+  <text x="635" y="435" class="text small">哪些片段最有助于回答</text>
+  <text x="635" y="462" class="text small">最终返回 Top K</text>
+
+  <path d="M270 180 H340" class="arrow"/>
+  <path d="M610 180 H690" class="arrow"/>
+  <path d="M855 255 C855 300 500 290 390 335" class="arrow"/>
+  <path d="M510 408 H610" class="arrow"/>
+</svg>

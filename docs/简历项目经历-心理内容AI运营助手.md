@@ -1,10 +1,10 @@
-# 心理内容 AI 运营助手：简历项目经历
+# Psych Counseling Answer Assistant：简历项目经历
 
 > 适用方向：AI 产品运营、发行运营 AI 方向、AIGC 应用实习、LLM/RAG 应用开发实习、内容平台策略实习。
 
 ## 中文简历版
 
-**心理内容 AI 运营助手 | 个人项目 | Python / Streamlit / SQLite / RAG / DashScope Qwen**
+**Psych Counseling Answer Assistant | 个人项目 | Python / Streamlit / SQLite / RAG / DashScope Qwen**
 
 - 设计并实现一套面向知乎心理类内容运营的本地 AI 工作台，将选题池、私有知识库、意图识别、RAG 检索、回答生成、人工编辑和风格反馈沉淀串成闭环流程，避免停留在单纯 ChatBot 套壳。
 - 搭建私有知识库管理模块，支持 PDF、docx、txt、md 等资料上传、文件夹分类、文本抽取、chunk 分块、向量化入库和索引重建；当前本地测试库约 12 份资料、260 万字、1678 个 chunks。
@@ -17,7 +17,7 @@
 
 ## 精简版
 
-**心理内容 AI 运营助手 | Python / Streamlit / SQLite / RAG / Qwen**
+**Psych Counseling Answer Assistant | Python / Streamlit / SQLite / RAG / Qwen**
 
 - 开发本地 AI 内容运营工作台，支持知乎选题解析、私有知识库维护、意图识别、RAG 检索、回答生成、人工编辑和风格反馈沉淀。
 - 实现 Summary Index、Vector Index、Sentence Window、Auto Merging 等多路检索策略，并支持检索阈值、Top K、重排和索引重建参数调节。
@@ -26,7 +26,7 @@
 
 ## 英文简历版
 
-**AI Content Operations Assistant | Personal Project | Python, Streamlit, SQLite, RAG, DashScope Qwen**
+**Psych Counseling Answer Assistant | Personal Project | Python, Streamlit, SQLite, RAG, DashScope Qwen**
 
 - Built a local AI-assisted content operations workspace for psychology-related Zhihu topics, covering topic intake, private knowledge base management, intent analysis, RAG retrieval, draft generation, human editing, and feedback-based style refinement.
 - Implemented a multi-stage RAG pipeline with Summary Index routing, vector retrieval, keyword matching, Sentence Window retrieval, and Auto Merging hierarchical retrieval; exposed configurable Top K, similarity thresholds, keyword thresholds, and reranking options.
@@ -61,4 +61,3 @@
 - RAG-based Content Operations Assistant
 - 私有知识库驱动的知乎回答生成与评估系统
 - 面向心理类内容创作的 AI 辅助决策工具
-

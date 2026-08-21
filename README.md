@@ -1,8 +1,8 @@
-# 心理类内容 AI 运营助手
+# Psych Counseling Answer Assistant
 
-一个本机运行的 AI 内容运营工作台，用来把「知乎选题池、私有知识库、意图识别、RAG 检索、回答生成、人工修改、风格反馈」串成完整流程。
+一个面向心理咨询类回答写作的 AI 助手，用来把「知乎选题池、私有知识库、意图识别、RAG 检索、回答生成、反馈重写、风格沉淀」串成完整流程。
 
-项目定位不是简单套壳聊天机器人，而是面向内容运营场景的 AI 辅助决策工具：先理解题目，再检索可信依据，最后生成可人工编辑的回答初稿。
+项目定位不是简单套壳聊天机器人，而是一个面向心理类内容回答的 AI 工作流：先理解题目，再检索可信依据，结合个人语料库和表达片段生成更接近本人语气的回答。
 
 ## 功能概览
 
@@ -10,7 +10,7 @@
 - RAG 维护：上传 PDF、docx、doc、txt、md 文件，按文件夹管理知识库。
 - 文档解析：优先提取原文文本，识别扫描版 PDF 和低质量文本层。
 - 意图识别：先分析问题真正想问什么、适合的回答角度和检索关键词。
-- 检索依据：基于意图识别结果检索知识库片段，支持 embedding 检索和本地词面检索回退。
+- 检索依据：基于意图识别结果检索知识库片段，使用 LlamaIndex Summary Route、VectorStoreIndex、BM25、QueryFusion、Sentence Window、Auto Merging 和 LLMRerank 组织检索链路。
 - 生成初稿：调用 OpenAI 兼容 Chat Completions API 生成中文回答。
 - 人工反馈：可以对意图识别或 AI 初稿分别提意见，并从对应步骤回退重跑。
 - 风格沉淀：保存人工终稿后，自动记录编辑反馈，并把终稿加入“我的旧回答”知识库。
@@ -21,6 +21,8 @@
 - Python
 - Streamlit
 - SQLite
+- LlamaIndex
+- BM25 / QueryFusionRetriever / AutoMergingRetriever
 - OpenAI-compatible Chat Completions API
 - OpenAI-compatible Embeddings API
 - pdfplumber / pypdf / python-docx
@@ -43,6 +45,7 @@ http://127.0.0.1:8501
 ```
 
 如果没有配置 API key，应用会进入本地演示/回退模式，方便先查看流程。没有配置 embedding key 时，RAG 会退回本地词面检索。
+LlamaIndex 的本地索引缓存保存在 `data/llamaindex_storage/`，和 SQLite 数据库一样默认不提交到 GitHub。
 
 ## 配置模型
 
@@ -84,6 +87,7 @@ EMBEDDING_MODEL=
 - `.streamlit/secrets.toml`
 
 `data/` 中通常包含 SQLite 数据库、知识库内容、个人语气文档和人工终稿，不建议公开上传。
+当前 RAG 索引由 LlamaIndex 缓存管理；SQLite 主要保存选题、文档原文、回答、反馈和配置。
 
 如果准备把项目发布到 GitHub，请只提交代码、配置样例和说明文档，不要提交真实 API key、数据库、个人文档或知乎回答原文。
 
@@ -91,7 +95,7 @@ EMBEDDING_MODEL=
 
 这个项目适合在简历中描述为：
 
-> 基于 RAG、意图识别和人工反馈闭环的心理类内容运营 AI 工作台。系统支持私有知识库维护、问题意图分析、检索依据追踪、回答初稿生成和人工终稿沉淀，用于探索 AI 在内容运营决策与个性化写作中的应用。
+> Psych Counseling Answer Assistant 是一个基于 RAG、意图识别、个人语料库和反馈重写闭环的心理类回答生成助手。系统支持私有知识库维护、问题意图分析、检索依据追踪、回答初稿生成、个人表达片段召回和 RAG Triad 评价，用于探索 AI 在心理类内容写作与个性化表达中的应用。
 
 ## 目录结构
 

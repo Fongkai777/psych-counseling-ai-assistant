@@ -40,6 +40,7 @@ class LLMClient:
             "yes",
             "on",
         }
+        self.rerank_model = config.get("RERANK_MODEL") or "qwen3-vl-rerank"
         self.last_embedding_error = ""
 
     def status(self):
@@ -50,7 +51,10 @@ class LLMClient:
             "embedding_mode": "api" if self.embedding_api_key else "local",
             "embedding_model": self.embedding_model,
             "embedding_batch_size": self.embedding_batch_size,
-            "rerank_mode": "llm" if self.rerank_enabled and self.api_key else "off",
+            "rerank_mode": "dashscope_api"
+            if self.rerank_enabled and self.dashscope_api_key
+            else "off",
+            "rerank_model": self.rerank_model,
         }
 
     def chat_payload(self, prompt, enable_thinking=None):
@@ -345,6 +349,103 @@ class LLMClient:
             if idx not in seen:
                 ranked.append(item)
         return ranked[:top_n]
+
+    def rerank_texts(self, query, documents, top_n=5, timeout=90):
+        if not self.dashscope_api_key or not self.rerank_enabled or not documents:
+            return []
+        documents = [(doc or "")[:6000] for doc in documents if (doc or "").strip()]
+        if not documents:
+            return []
+        payload = {
+            "model": self.rerank_model,
+            "input": {
+                "query": query,
+                "documents": documents[:50],
+            },
+            "parameters": {
+                "return_documents": True,
+                "top_n": max(1, min(int(top_n or 5), len(documents))),
+            },
+        }
+        req = urllib.request.Request(
+            "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.dashscope_api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            try:
+                body = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                body = ""
+            self.last_embedding_error = (
+                f"Rerank API HTTP {exc.code}: model={self.rerank_model}, body={body[:800]}"
+            )
+            LOGGER.warning(self.last_embedding_error)
+            return []
+        except (
+            urllib.error.URLError,
+            socket.timeout,
+            TimeoutError,
+            KeyError,
+            json.JSONDecodeError,
+        ) as exc:
+            self.last_embedding_error = f"Rerank API 调用失败：{type(exc).__name__}: {exc}"
+            LOGGER.warning(self.last_embedding_error)
+            return []
+
+        raw_results = (
+            data.get("output", {}).get("results")
+            or data.get("output", {}).get("result")
+            or data.get("results")
+            or []
+        )
+        results = []
+        used_indexes = set()
+        for item in raw_results:
+            index = None
+            document = item.get("document") or item.get("text") or item.get("content") or ""
+            if isinstance(document, dict):
+                document = document.get("text") or document.get("content") or ""
+            if document:
+                for candidate_index, candidate in enumerate(documents):
+                    if candidate_index not in used_indexes and candidate == document:
+                        index = candidate_index
+                        break
+            if index is None:
+                index = item.get("index")
+            try:
+                index = int(index)
+            except (TypeError, ValueError):
+                continue
+            if not 0 <= index < len(documents) and 1 <= index <= len(documents):
+                index = index - 1
+            if not 0 <= index < len(documents):
+                continue
+            used_indexes.add(index)
+            score = (
+                item.get("relevance_score")
+                if item.get("relevance_score") is not None
+                else item.get("score", 0)
+            )
+            try:
+                score = float(score)
+            except (TypeError, ValueError):
+                score = 0.0
+            results.append(
+                {
+                    "index": index,
+                    "score": score,
+                    "document": document or documents[index],
+                }
+            )
+        return results[:top_n]
 
     def demo_answer(self, prompt):
         title = "这个问题背后，可能不是简单的“不够努力”。"
