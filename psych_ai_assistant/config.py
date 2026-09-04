@@ -24,7 +24,9 @@ def load_config(env_path: Path):
         "EMBEDDING_API_KEY",
         "EMBEDDING_BASE_URL",
         "EMBEDDING_MODEL",
+        "EMBEDDING_MAX_INPUT_CHARS",
         "EMBEDDING_BATCH_SIZE",
+        "RERANK_MODEL",
         "APP_HOST",
         "APP_PORT",
     ):

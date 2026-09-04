@@ -1,16 +1,16 @@
-# Psych Counseling Answer Assistant
+# Counseling Copilot
 
-一个面向心理咨询类回答写作的 AI 助手，用来把「知乎选题池、私有知识库、意图识别、RAG 检索、回答生成、反馈重写、风格沉淀」串成完整流程。
+一个面向心理咨询类问答的 AI 助手，用来把「用户提问、私有知识库、意图识别、RAG 检索、回答生成、反馈重写、风格沉淀」串成完整流程。
 
-项目定位不是简单套壳聊天机器人，而是一个面向心理类内容回答的 AI 工作流：先理解题目，再检索可信依据，结合个人语料库和表达片段生成更接近本人语气的回答。
+项目定位不是简单套壳聊天机器人，而是一个可个性化的心理类问答助手：用户输入问题后，系统先理解问题，再检索可信依据，结合个人语料库和表达片段生成更接近本人语气的回答。
 
 ## 功能概览
 
-- 选题池：从粘贴的知乎页面 HTML 中解析问题标题，维护待回答选题。
+- 开始提问：用户直接输入问题，也可以从推荐问题中一键选择并生成回答。
 - RAG 维护：上传 PDF、docx、doc、txt、md 文件，按文件夹管理知识库。
 - 文档解析：优先提取原文文本，识别扫描版 PDF 和低质量文本层。
 - 意图识别：先分析问题真正想问什么、适合的回答角度和检索关键词。
-- 检索依据：基于意图识别结果检索知识库片段，使用 LlamaIndex Summary Route、VectorStoreIndex、BM25、QueryFusion、Sentence Window、Auto Merging 和 LLMRerank 组织检索链路。
+- 检索依据：基于意图识别结果检索知识库片段，使用 LlamaIndex Summary Route、VectorStoreIndex、BM25、QueryFusion、Chunk Window、Auto Merging 和 LLMRerank 组织检索链路。
 - 生成初稿：调用 OpenAI 兼容 Chat Completions API 生成中文回答。
 - 人工反馈：可以对意图识别或 AI 初稿分别提意见，并从对应步骤回退重跑。
 - 风格沉淀：保存人工终稿后，自动记录编辑反馈，并把终稿加入“我的旧回答”知识库。
@@ -35,7 +35,7 @@
 python -m venv .venv
 .venv/bin/pip install -r requirements.txt
 cp .env.example .env
-.venv/bin/streamlit run streamlit_app.py
+.venv/bin/python -m streamlit run streamlit_app.py
 ```
 
 打开：
@@ -65,10 +65,10 @@ EMBEDDING_MODEL=
 
 ## 使用流程
 
-1. 在「选题池」粘贴知乎问题页面 HTML，加入候选选题。
-2. 在「RAG 维护」上传本地资料，按文件夹整理知识库。
-3. 在「回答工作台」选择问题。
-4. 点击「运行流程 / 按意见重跑」：
+1. 在「开始提问」输入问题，或从推荐问题中选择一个问题。
+2. 点击「生成回答」，系统会自动执行意图识别、RAG 检索、个人表达匹配和回答生成。
+3. 在「RAG 维护」上传本地资料，按文件夹整理知识库。
+4. 在「回答工作台」查看和调试完整生成链路：
    - 意图识别
    - 检索依据
    - 生成 AI 初稿
@@ -95,7 +95,7 @@ EMBEDDING_MODEL=
 
 这个项目适合在简历中描述为：
 
-> Psych Counseling Answer Assistant 是一个基于 RAG、意图识别、个人语料库和反馈重写闭环的心理类回答生成助手。系统支持私有知识库维护、问题意图分析、检索依据追踪、回答初稿生成、个人表达片段召回和 RAG Triad 评价，用于探索 AI 在心理类内容写作与个性化表达中的应用。
+> Counseling Copilot 是一个基于 RAG、意图识别、个人语料库和反馈重写闭环的心理类回答生成助手。系统支持私有知识库维护、问题意图分析、检索依据追踪、回答初稿生成、个人表达片段召回和 RAG Triad 评价，用于探索 AI 在心理类内容写作与个性化表达中的应用。
 
 ## 目录结构
 

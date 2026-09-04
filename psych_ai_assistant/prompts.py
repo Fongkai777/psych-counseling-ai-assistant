@@ -49,6 +49,39 @@ def build_intent_prompt(question, feedback=""):
 """
 
 
+def build_retrieval_plan_prompt(question, intent="", feedback=""):
+    return f"""请把下面这个知乎问题和意图识别结果，改写成适合 RAG 检索的结构化检索计划。
+
+这个计划会用于：
+1. 先通过 Summary Route 判断应该优先检索哪些资料。
+2. 再通过 Vector/BM25、Chunk Window、Auto Merging 召回具体片段。
+
+【问题标题】
+{question['title']}
+
+【问题描述】
+{question.get('description') or '无'}
+
+【意图识别】
+{intent or '无'}
+
+【人工检索意见】
+{feedback or '无'}
+
+请只输出 JSON，不要输出 Markdown，不要解释 JSON 之外的内容。
+
+字段要求：
+{{
+  "core_query": "一句话概括本次真正要检索的问题",
+  "document_routing_topics": ["用于筛选候选文档的主题/书籍/理论方向"],
+  "semantic_queries": ["2-4 条适合向量检索的自然语言 query"],
+  "keywords": ["适合 BM25 的关键词、概念词、人物名、书名"],
+  "must_include": ["希望优先出现的证据类型"],
+  "avoid": ["容易跑偏或不要检索的方向"]
+}}
+"""
+
+
 def build_answer_prompt(
     question,
     context,
@@ -108,7 +141,10 @@ def build_answer_prompt(
 - 优先使用清楚的判断、概念解释、场景对比和具体行动。
 - 可以有温度，但表达要平实、克制、像一个人在认真说明问题。
 - 不编造研究者、年份、数据或个人经历；除非可引用知识片段中明确提供。
-- 个人表达片段只用于语气、意象和可复用表达。只有复用方式允许“直接引用”且与本题自然贴合时，才可以原句使用；否则只吸收表达方式，不要硬塞。
+- 个人表达片段不是心理学证据，不能替代可引用知识片段。
+- 如果使用“可逐字引用”的个人表达片段，必须完整复制原文，不要改写、续写、拆碎重组。
+- 每篇回答最多逐字引用 1 条个人表达片段；不贴合时可以不用。
+- 不要把个人表达片段包装成用户经历、研究结论或书籍原文。
 
 【任务】
 请根据上述材料输出一版完整回答初稿。不要解释你遵守了哪些规则，直接输出正文。
@@ -186,6 +222,16 @@ def format_expression_snippets(snippets):
         return "无。不要为了模仿风格而硬编私人经历或硬塞金句。"
     lines = []
     for index, item in enumerate(snippets, start=1):
+        reuse_mode = item.get("reuse_mode", "")
+        can_quote = any(
+            marker in reuse_mode
+            for marker in ("直接", "原文", "引用", "金句", "整句")
+        )
+        quote_policy = (
+            "可逐字引用：如果使用，必须完整复制下面“原文片段”，不得改写。"
+            if can_quote
+            else "只作为语气参考：不要逐字硬塞，也不要编造成个人经历。"
+        )
         lines.append(
             "\n".join(
                 part
@@ -193,8 +239,9 @@ def format_expression_snippets(snippets):
                     f"[{index}] {item.get('title', '')}",
                     f"主题：{item.get('themes', '')}",
                     f"适用场景：{item.get('usage', '')}",
-                    f"复用方式：{item.get('reuse_mode', '')}",
-                    f"片段：{item.get('text', '')}",
+                    f"复用方式：{reuse_mode}",
+                    f"使用规则：{quote_policy}",
+                    f"原文片段：{item.get('text', '')}",
                 ]
                 if part.strip()
             )

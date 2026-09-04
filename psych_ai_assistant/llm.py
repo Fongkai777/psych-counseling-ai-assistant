@@ -1,6 +1,7 @@
 import json
 import logging
 import http.client
+import re
 import socket
 import time
 import urllib.error
@@ -8,7 +9,9 @@ import urllib.request
 
 
 LOGGER = logging.getLogger(__name__)
-DEFAULT_MAX_EMBEDDING_INPUT_CHARS = 7800
+DEFAULT_MAX_EMBEDDING_INPUT_CHARS = 8000
+DASHSCOPE_EMBEDDING_MAX_INPUT_CHARS = 8000
+DASHSCOPE_EMBEDDING_BATCH_SIZE = 10
 
 
 class EmbeddingAPIError(Exception):
@@ -34,10 +37,16 @@ class LLMClient:
             config.get("EMBEDDING_BASE_URL") or self.base_url
         ).rstrip("/")
         self.embedding_model = config.get("EMBEDDING_MODEL") or "text-embedding-3-small"
-        self.embedding_batch_size = max(1, min(20, int(config.get("EMBEDDING_BATCH_SIZE") or 5)))
+        self.embedding_batch_size = max(
+            1,
+            min(int(config.get("EMBEDDING_BATCH_SIZE") or 5), self._provider_embedding_batch_cap()),
+        )
+        configured_embedding_max = int(
+            config.get("EMBEDDING_MAX_INPUT_CHARS") or DEFAULT_MAX_EMBEDDING_INPUT_CHARS
+        )
         self.embedding_max_input_chars = max(
             1000,
-            min(30000, int(config.get("EMBEDDING_MAX_INPUT_CHARS") or DEFAULT_MAX_EMBEDDING_INPUT_CHARS)),
+            min(configured_embedding_max, self._provider_embedding_input_cap()),
         )
         self.rerank_enabled = str(config.get("RERANK_ENABLED", "")).lower() in {
             "1",
@@ -187,7 +196,7 @@ class LLMClient:
         texts = [self._fit_embedding_input(text) for text in texts]
         embeddings = []
         batch_size = max(1, int(batch_size or self.embedding_batch_size))
-        batch_size = min(20, batch_size)
+        batch_size = min(self._provider_embedding_batch_cap(), batch_size)
         total_batches = (len(texts) + batch_size - 1) // batch_size if texts else 0
         for start in range(0, len(texts), batch_size):
             batch = texts[start : start + batch_size]
@@ -213,9 +222,23 @@ class LLMClient:
                 progress_callback(min(total_batches, start // batch_size + 1), total_batches)
         return embeddings
 
-    def _fit_embedding_input(self, text):
+    def _provider_embedding_input_cap(self):
+        model = (self.embedding_model or "").lower()
+        base_url = (self.embedding_base_url or "").lower()
+        if "dashscope.aliyuncs.com" in base_url and model == "text-embedding-v4":
+            return DASHSCOPE_EMBEDDING_MAX_INPUT_CHARS
+        return 30000
+
+    def _provider_embedding_batch_cap(self):
+        model = (self.embedding_model or "").lower()
+        base_url = (self.embedding_base_url or "").lower()
+        if "dashscope.aliyuncs.com" in base_url and model == "text-embedding-v4":
+            return DASHSCOPE_EMBEDDING_BATCH_SIZE
+        return 20
+
+    def _fit_embedding_input(self, text, max_chars=None):
         text = text or ""
-        max_chars = self.embedding_max_input_chars
+        max_chars = int(max_chars or self.embedding_max_input_chars)
         if len(text) <= max_chars:
             return text
         head_size = max_chars // 2
@@ -232,10 +255,19 @@ class LLMClient:
         LOGGER.warning(
             "Embedding input truncated from %s to %s chars for model=%s",
             len(text),
-            len(fitted),
+            min(len(fitted), max_chars),
             self.embedding_model,
         )
         return fitted[:max_chars]
+
+    def _parse_embedding_input_limit(self, body):
+        match = re.search(r"Range of input length should be \[1,\s*(\d+)\]", body or "")
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
 
     def _embed_text_batch_resilient(self, texts, raise_on_error=False):
         try:
@@ -289,6 +321,18 @@ class LLMClient:
                     body = exc.read().decode("utf-8", errors="replace")
                 except Exception:
                     body = ""
+                api_limit = self._parse_embedding_input_limit(body)
+                if len(texts) == 1 and api_limit and char_count > api_limit:
+                    safe_limit = max(1000, min(self.embedding_max_input_chars, api_limit - 300))
+                    self.embedding_max_input_chars = safe_limit
+                    shortened = self._fit_embedding_input(texts[0], max_chars=safe_limit)
+                    if shortened != texts[0]:
+                        LOGGER.warning(
+                            "Embedding API reported input limit %s; retrying with %s chars",
+                            api_limit,
+                            len(shortened),
+                        )
+                        return self._embed_text_batch([shortened])
                 message = (
                     f"Embedding API HTTP {exc.code}: model={self.embedding_model}, "
                     f"url={self.embedding_base_url}/embeddings, batch={len(texts)}, "

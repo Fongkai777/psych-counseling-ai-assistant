@@ -15,13 +15,10 @@ from llama_index.core.llms import CompletionResponse, CustomLLM, LLMMetadata
 from llama_index.core.node_parser import (
     HierarchicalNodeParser,
     SentenceSplitter,
-    SentenceWindowNodeParser,
     get_leaf_nodes,
 )
-from llama_index.core.postprocessor import LLMRerank, MetadataReplacementPostProcessor
-from llama_index.core.retrievers import AutoMergingRetriever, QueryFusionRetriever
-from llama_index.core.retrievers.fusion_retriever import FUSION_MODES
-from llama_index.core.schema import TextNode
+from llama_index.core.retrievers import AutoMergingRetriever
+from llama_index.core.schema import NodeWithScore, TextNode
 from llama_index.retrievers.bm25 import BM25Retriever
 
 from psych_ai_assistant.retrieval import (
@@ -36,6 +33,14 @@ from psych_ai_assistant.retrieval import (
 
 LOGGER = logging.getLogger(__name__)
 warnings.filterwarnings("ignore", message="The tokenizer parameter is deprecated.*")
+
+
+class RAGIndexUnavailable(Exception):
+    """Raised when retrieval needs a persisted index that is missing or stale."""
+
+
+class RAGRetrievalError(Exception):
+    """Raised when LlamaIndex retrieval cannot complete."""
 
 
 class DashScopeEmbeddingAdapter(BaseEmbedding):
@@ -154,13 +159,31 @@ class LlamaIndexRetriever:
         use_summary_index=True,
         summary_limit=6,
         retrieval_mode="hybrid",
-        sentence_window_size=2,
+        retrieval_modes=None,
+        chunk_window_size=1,
         auto_merge_group_size=3,
         auto_merge_threshold=0.5,
         folder_filter="全部",
         source_filter="全部",
+        route_query=None,
+        semantic_query=None,
+        lexical_query=None,
+        rerank_query=None,
+        progress_callback=None,
     ):
+        def report(percent, label):
+            if progress_callback:
+                progress_callback(percent, label)
+
         started_at = time.perf_counter()
+        route_query = route_query or query
+        semantic_query = semantic_query or query
+        lexical_query = lexical_query or query
+        rerank_query = rerank_query or query
+        if self.llm:
+            self.llm.last_embedding_error = ""
+        retrieval_modes = self.normalize_retrieval_modes(retrieval_modes, retrieval_mode)
+        retrieval_mode = retrieval_modes[0]
         settings = {
             "limit": limit,
             "min_semantic_score": min_semantic_score,
@@ -169,138 +192,115 @@ class LlamaIndexRetriever:
             "use_summary_index": use_summary_index,
             "summary_limit": summary_limit,
             "retrieval_mode": retrieval_mode,
-            "sentence_window_size": sentence_window_size,
+            "retrieval_modes": retrieval_modes,
+            "chunk_window_size": chunk_window_size,
             "auto_merge_group_size": auto_merge_group_size,
             "auto_merge_threshold": auto_merge_threshold,
             "folder_filter": folder_filter,
             "source_filter": source_filter,
+            "route_query": route_query,
+            "semantic_query": semantic_query,
+            "lexical_query": lexical_query,
+            "rerank_query": rerank_query,
         }
         metadata_filter = self.metadata_filter(folder_filter, source_filter)
         if not self.llm or not getattr(self.llm, "embedding_api_key", ""):
-            results = self.legacy.search(
-                query,
-                limit=limit,
-                min_semantic_score=min_semantic_score,
-                min_lexical_score=min_lexical_score,
-                min_score=min_score,
-                use_summary_index=use_summary_index,
-                summary_limit=summary_limit,
-                retrieval_mode=retrieval_mode,
-                sentence_window_size=sentence_window_size,
-                auto_merge_group_size=auto_merge_group_size,
-                auto_merge_threshold=auto_merge_threshold,
-            )
-            self.record_trace(
-                query,
-                "legacy_local",
-                settings,
-                [],
-                [],
-                results,
-                started_at,
-            )
-            return results
+            message = "LlamaIndex 高级检索需要 embedding API；当前没有配置 EMBEDDING_API_KEY，已停止检索。"
+            if self.llm:
+                self.llm.last_embedding_error = message
+            raise RAGRetrievalError(message)
 
         summary_routes = []
         document_ids = None
         if use_summary_index:
-            summary_routes = self.summary_route(
-                query,
-                summary_limit,
-                metadata_filter=metadata_filter,
-            )
-            document_ids = [item["document_id"] for item in summary_routes]
+            report(0.35, "Document Router：正在筛选候选文档")
+            try:
+                summary_routes = self.summary_route(
+                    route_query,
+                    summary_limit,
+                    metadata_filter=metadata_filter,
+                    allow_build=False,
+                )
+                document_ids = [item["document_id"] for item in summary_routes]
+                report(0.48, f"Document Router 完成：候选文档 {len(document_ids)} 个")
+            except RAGIndexUnavailable as exc:
+                message = self.describe_retrieval_exception(exc, stage="Document Router")
+                if self.llm:
+                    self.llm.last_embedding_error = message
+                report(1.0, "Document Router 索引不可用：已停止检索")
+                raise RAGRetrievalError(message) from exc
+        else:
+            report(0.45, "Document Router 已跳过：直接进入片段召回")
 
         raw_limit = max(limit * 8, 20)
         try:
-            if retrieval_mode == "sentence_window":
-                hits = self.sentence_window_retrieve(
-                    query,
-                    raw_limit,
-                    document_ids=document_ids,
-                    window_size=sentence_window_size,
-                    metadata_filter=metadata_filter,
-                )
-            elif retrieval_mode == "auto_merging":
-                hits = self.auto_merging_retrieve(
-                    query,
-                    raw_limit,
-                    document_ids=document_ids,
-                    merge_threshold=auto_merge_threshold,
-                    metadata_filter=metadata_filter,
-                )
-            else:
-                hits = self.hybrid_retrieve(
-                    query,
-                    raw_limit,
-                    document_ids=document_ids,
-                    metadata_filter=metadata_filter,
-                )
-        except Exception as exc:
-            LOGGER.exception("LlamaIndex retrieval failed; falling back to legacy search")
-            if self.llm:
-                self.llm.last_embedding_error = f"LlamaIndex 检索失败，已回退旧检索：{exc}"
-            results = self.legacy.search(
+            hits = self.retrieve_with_modes(
                 query,
-                limit=limit,
-                min_semantic_score=min_semantic_score,
-                min_lexical_score=min_lexical_score,
-                min_score=min_score,
-                use_summary_index=use_summary_index,
-                summary_limit=summary_limit,
-                retrieval_mode=retrieval_mode,
-                sentence_window_size=sentence_window_size,
-                auto_merge_group_size=auto_merge_group_size,
+                raw_limit,
+                retrieval_modes,
+                semantic_query=semantic_query,
+                lexical_query=lexical_query,
+                document_ids=document_ids,
+                chunk_window_size=chunk_window_size,
                 auto_merge_threshold=auto_merge_threshold,
+                metadata_filter=metadata_filter,
+                progress_callback=progress_callback,
             )
+        except Exception as exc:
+            LOGGER.exception("LlamaIndex retrieval failed")
+            message = self.describe_retrieval_exception(exc)
+            if self.llm:
+                self.llm.last_embedding_error = message
+            report(1.0, "LlamaIndex 检索失败：已停止")
             self.record_trace(
                 query,
-                "legacy_fallback",
+                "llamaindex_failed",
                 settings,
                 summary_routes,
                 [],
-                results,
+                [],
                 started_at,
             )
-            return results
+            raise RAGRetrievalError(message) from exc
 
         if not hits and document_ids:
-            if retrieval_mode == "sentence_window":
-                hits = self.sentence_window_retrieve(
-                    query,
-                    raw_limit,
-                    window_size=sentence_window_size,
-                    metadata_filter=metadata_filter,
-                )
-            elif retrieval_mode == "auto_merging":
-                hits = self.auto_merging_retrieve(
-                    query,
-                    raw_limit,
-                    merge_threshold=auto_merge_threshold,
-                    metadata_filter=metadata_filter,
-                )
-            else:
-                hits = self.hybrid_retrieve(query, raw_limit, metadata_filter=metadata_filter)
+            report(0.62, "候选文档内未命中：放宽到全库重检索")
+            hits = self.retrieve_with_modes(
+                query,
+                raw_limit,
+                retrieval_modes,
+                semantic_query=semantic_query,
+                lexical_query=lexical_query,
+                chunk_window_size=chunk_window_size,
+                auto_merge_threshold=auto_merge_threshold,
+                metadata_filter=metadata_filter,
+                progress_callback=progress_callback,
+            )
 
         candidate_trace = [self.node_to_trace_item(hit) for hit in hits[:30]]
+        report(0.76, f"过滤强度：正在筛选 {len(hits)} 个候选片段")
         hits = self.filter_nodes(
             hits,
             min_semantic_score=min_semantic_score,
             min_lexical_score=min_lexical_score,
             min_score=min_score,
         )
-        hits = self.llamaindex_rerank(query, hits, limit)
+        report(0.84, f"过滤完成：剩余 {len(hits)} 个候选片段")
+        if getattr(self.llm, "rerank_enabled", False):
+            report(0.90, "Rerank：正在调用千问重排候选片段")
+        hits = self.llamaindex_rerank(rerank_query, hits, limit)
         results = [
             self.node_to_result(
                 hit,
                 summary_routes=summary_routes,
-                mode=self.result_mode(retrieval_mode),
+                mode=self.result_mode(retrieval_modes),
             )
             for hit in hits[:limit]
         ]
+        report(0.98, f"整理结果：准备返回 Top {min(limit, len(results))}")
         self.record_trace(
             query,
-            self.result_mode(retrieval_mode),
+            self.result_mode(retrieval_modes),
             settings,
             summary_routes,
             candidate_trace,
@@ -309,25 +309,145 @@ class LlamaIndexRetriever:
         )
         return results
 
-    def hybrid_retrieve(self, query, limit, document_ids=None, metadata_filter=None):
-        index, nodes = self.ensure_vector_index()
+    def normalize_retrieval_modes(self, retrieval_modes=None, fallback="hybrid"):
+        valid = {"hybrid", "chunk_window", "auto_merging"}
+        if isinstance(retrieval_modes, str):
+            retrieval_modes = [item.strip() for item in retrieval_modes.split(",")]
+        normalized = [
+            "chunk_window" if mode == "sentence_window" else mode
+            for mode in (retrieval_modes or [])
+        ]
+        fallback = "chunk_window" if fallback == "sentence_window" else fallback
+        modes = [mode for mode in normalized if mode in valid]
+        if modes:
+            return modes
+        return [fallback if fallback in valid else "hybrid"]
+
+    def retrieve_with_modes(
+        self,
+        query,
+        raw_limit,
+        retrieval_modes,
+        semantic_query=None,
+        lexical_query=None,
+        document_ids=None,
+        chunk_window_size=1,
+        auto_merge_threshold=0.5,
+        metadata_filter=None,
+        progress_callback=None,
+    ):
+        hits = []
+        mode_labels = {
+            "hybrid": "Vector/BM25 Fusion",
+            "chunk_window": "Chunk Window",
+            "auto_merging": "Auto Merging",
+        }
+        total_modes = max(1, len(retrieval_modes))
+        for index, mode in enumerate(retrieval_modes, start=1):
+            if progress_callback:
+                label = mode_labels.get(mode, mode)
+                progress_callback(
+                    0.50 + (index - 1) / total_modes * 0.22,
+                    f"片段召回：{label} ({index}/{total_modes})",
+                )
+            if mode == "chunk_window":
+                try:
+                    mode_hits = self.chunk_window_retrieve(
+                        query,
+                        raw_limit,
+                        semantic_query=semantic_query,
+                        lexical_query=lexical_query,
+                        document_ids=document_ids,
+                        window_size=chunk_window_size,
+                        metadata_filter=metadata_filter,
+                        allow_build=False,
+                    )
+                except RAGIndexUnavailable as exc:
+                    raise RAGRetrievalError(
+                        self.describe_retrieval_exception(exc, stage="Chunk Window")
+                    ) from exc
+            elif mode == "auto_merging":
+                try:
+                    mode_hits = self.auto_merging_retrieve(
+                        semantic_query or query,
+                        raw_limit,
+                        document_ids=document_ids,
+                        merge_threshold=auto_merge_threshold,
+                        metadata_filter=metadata_filter,
+                        allow_build=False,
+                    )
+                except RAGIndexUnavailable as exc:
+                    raise RAGRetrievalError(
+                        self.describe_retrieval_exception(exc, stage="Auto Merging")
+                    ) from exc
+            else:
+                try:
+                    mode_hits = self.hybrid_retrieve(
+                        query,
+                        raw_limit,
+                        semantic_query=semantic_query,
+                        lexical_query=lexical_query,
+                        document_ids=document_ids,
+                        metadata_filter=metadata_filter,
+                        allow_build=False,
+                    )
+                except RAGIndexUnavailable as exc:
+                    raise RAGRetrievalError(
+                        self.describe_retrieval_exception(exc, stage="Vector/BM25 Fusion")
+                    ) from exc
+            hits.extend(mode_hits)
+            if progress_callback:
+                label = mode_labels.get(mode, mode)
+                progress_callback(
+                    0.50 + index / total_modes * 0.22,
+                    f"片段召回完成：{label} 命中 {len(mode_hits)} 个候选",
+                )
+        return self.dedupe_hits(hits)
+
+    def dedupe_hits(self, hits):
+        best_by_key = {}
+        for hit in hits:
+            content = hit.node.get_content(metadata_mode="none") or ""
+            metadata = dict(hit.node.metadata or {})
+            key = (
+                hit.node.node_id
+                or f"{metadata.get('document_id')}:{hashlib.sha1(content.encode('utf-8')).hexdigest()}"
+            )
+            existing = best_by_key.get(key)
+            if existing is None or float(hit.score or 0) > float(existing.score or 0):
+                best_by_key[key] = hit
+        return sorted(best_by_key.values(), key=lambda item: float(item.score or 0), reverse=True)
+
+    def hybrid_retrieve(
+        self,
+        query,
+        limit,
+        semantic_query=None,
+        lexical_query=None,
+        document_ids=None,
+        metadata_filter=None,
+        allow_build=True,
+    ):
+        index, nodes = self.ensure_vector_index(allow_build=allow_build)
         if not index:
             return []
-        return self.query_fusion_retrieve(
+        return self.channel_fusion_retrieve(
             query,
             index,
             nodes,
             limit,
+            semantic_query=semantic_query,
+            lexical_query=lexical_query,
             document_ids=document_ids,
             metadata_filter=metadata_filter,
-            retrieval_stage="llamaindex_query_fusion",
+            retrieval_stage="llamaindex_hybrid_fusion",
         )
 
-    def summary_route(self, query, limit=6, metadata_filter=None):
-        index, nodes = self.ensure_summary_index()
+    def summary_route(self, query, limit=6, metadata_filter=None, allow_build=True):
+        index, nodes = self.ensure_summary_index(allow_build=allow_build)
         if not index:
             return []
-        hits = self.query_fusion_retrieve(
+        hits = self.channel_fusion_retrieve(
             query,
             index,
             nodes,
@@ -360,28 +480,84 @@ class LlamaIndexRetriever:
                 break
         return routes
 
-    def sentence_window_retrieve(
+    def chunk_window_retrieve(
         self,
         query,
         limit,
+        semantic_query=None,
+        lexical_query=None,
         document_ids=None,
         window_size=2,
         metadata_filter=None,
+        allow_build=True,
     ):
-        index, nodes = self.ensure_sentence_window_index(window_size)
+        index, nodes = self.ensure_vector_index(allow_build=allow_build)
         if not index:
             return []
-        hits = self.query_fusion_retrieve(
+        hits = self.channel_fusion_retrieve(
             query,
             index,
             nodes,
             limit,
+            semantic_query=semantic_query,
+            lexical_query=lexical_query,
             document_ids=document_ids,
             metadata_filter=metadata_filter,
-            retrieval_stage="llamaindex_sentence_window",
+            retrieval_stage="llamaindex_chunk_window",
         )
-        processor = MetadataReplacementPostProcessor(target_metadata_key="window")
-        return processor.postprocess_nodes(hits, query_str=query)
+        return self.expand_chunk_windows(hits, nodes, window_size)
+
+    def expand_chunk_windows(self, hits, nodes, window_size=1):
+        window_size = max(0, min(5, int(window_size or 0)))
+        nodes_by_doc = {}
+        for node in nodes:
+            metadata = node.metadata or {}
+            document_id = int(metadata.get("document_id") or 0)
+            chunk_index = int(metadata.get("chunk_index") or 0)
+            nodes_by_doc.setdefault(document_id, {})[chunk_index] = node
+
+        expanded = []
+        for hit in hits:
+            metadata = dict(hit.node.metadata or {})
+            document_id = int(metadata.get("document_id") or 0)
+            hit_chunk_index = int(metadata.get("chunk_index") or 0)
+            doc_nodes = nodes_by_doc.get(document_id, {})
+            if not doc_nodes:
+                expanded.append(hit)
+                continue
+            start = max(0, hit_chunk_index - window_size)
+            end = hit_chunk_index + window_size
+            window_nodes = [
+                doc_nodes[index]
+                for index in range(start, end + 1)
+                if index in doc_nodes
+            ]
+            if not window_nodes:
+                expanded.append(hit)
+                continue
+            content = "\n\n".join(
+                node.get_content(metadata_mode="none") or "" for node in window_nodes
+            )
+            metadata.update(
+                {
+                    "retrieval_stage": "llamaindex_chunk_window",
+                    "window_size": window_size,
+                    "window_unit": "chunk",
+                    "hit_chunk_index": hit_chunk_index,
+                    "window_start_chunk": start,
+                    "window_end_chunk": max(
+                        int((node.metadata or {}).get("chunk_index") or start)
+                        for node in window_nodes
+                    ),
+                }
+            )
+            window_node = TextNode(
+                text=content,
+                id_=f"chunk-window-{document_id}-{start}-{metadata['window_end_chunk']}-{hit_chunk_index}",
+                metadata=metadata,
+            )
+            expanded.append(NodeWithScore(node=window_node, score=hit.score))
+        return expanded
 
     def auto_merging_retrieve(
         self,
@@ -390,8 +566,9 @@ class LlamaIndexRetriever:
         document_ids=None,
         merge_threshold=0.5,
         metadata_filter=None,
+        allow_build=True,
     ):
-        index, storage_context = self.ensure_auto_merging_index()
+        index, storage_context = self.ensure_auto_merging_index(allow_build=allow_build)
         if not index or not storage_context:
             return []
         vector_retriever = index.as_retriever(similarity_top_k=max(1, int(limit or 1)))
@@ -414,16 +591,20 @@ class LlamaIndexRetriever:
             retrieval_stage="llamaindex_auto_merging",
         )
 
-    def query_fusion_retrieve(
+    def channel_fusion_retrieve(
         self,
         query,
         index,
         nodes,
         limit,
+        semantic_query=None,
+        lexical_query=None,
         document_ids=None,
         metadata_filter=None,
-        retrieval_stage="llamaindex_query_fusion",
+        retrieval_stage="llamaindex_hybrid_fusion",
     ):
+        semantic_query = semantic_query or query
+        lexical_query = lexical_query or query
         top_k = max(1, min(int(limit or 1), len(nodes)))
         vector_retriever = index.as_retriever(similarity_top_k=top_k)
         bm25_retriever = BM25Retriever.from_defaults(
@@ -431,24 +612,28 @@ class LlamaIndexRetriever:
             similarity_top_k=top_k,
             tokenizer=chinese_tokenizer,
         )
-        vector_hits = vector_retriever.retrieve(query)
-        bm25_hits = bm25_retriever.retrieve(query)
+        vector_hits = vector_retriever.retrieve(semantic_query)
+        bm25_hits = bm25_retriever.retrieve(lexical_query)
         vector_scores = self.normalize_scores(
             {hit.node.node_id: float(hit.score or 0) for hit in vector_hits}
         )
         bm25_scores = self.normalize_scores(
             {hit.node.node_id: float(hit.score or 0) for hit in bm25_hits}
         )
-        retriever = QueryFusionRetriever(
-            [vector_retriever, bm25_retriever],
-            llm=self.llama_llm,
-            mode=FUSION_MODES.RELATIVE_SCORE,
-            similarity_top_k=top_k,
-            num_queries=1,
-            use_async=False,
-            retriever_weights=[0.65, 0.35],
+        hits_by_id = {}
+        for hit in [*vector_hits, *bm25_hits]:
+            node_id = hit.node.node_id
+            semantic_score = vector_scores.get(node_id, 0)
+            lexical_score = bm25_scores.get(node_id, 0)
+            fusion_score = 0.65 * semantic_score + 0.35 * lexical_score
+            if node_id not in hits_by_id or fusion_score > float(hits_by_id[node_id].score or 0):
+                hit.score = fusion_score
+                hits_by_id[node_id] = hit
+        hits = sorted(
+            hits_by_id.values(),
+            key=lambda item: float(item.score or 0),
+            reverse=True,
         )
-        hits = retriever.retrieve(query)
         return self.annotate_and_filter_by_document(
             hits,
             vector_scores=vector_scores,
@@ -458,26 +643,32 @@ class LlamaIndexRetriever:
             retrieval_stage=retrieval_stage,
         )
 
-    def ensure_vector_index(self):
+    def ensure_vector_index(self, allow_build=True):
         chunk_size, chunk_overlap, _, hierarchy_sizes = self.index_settings()
         signature = self.source_signature("vector", chunk_size, chunk_overlap)
+        kind = "vector"
         cached = self._cache.get("vector")
         if cached and cached["signature"] == signature:
             return cached["index"], cached["nodes"]
+        if not allow_build:
+            self.require_valid_index(kind, signature)
 
         nodes = self.build_vector_nodes(chunk_size, chunk_overlap)
-        index = self.load_or_build_index("vector", signature, nodes)
+        index = self.load_or_build_index(kind, signature, nodes, allow_build=allow_build)
         self._cache["vector"] = {"signature": signature, "index": index, "nodes": nodes}
         return index, nodes
 
-    def ensure_summary_index(self):
+    def ensure_summary_index(self, allow_build=True):
         signature = self.source_signature("summary_route")
+        kind = "summary_route"
         cached = self._cache.get("summary_route")
         if cached and cached["signature"] == signature:
             return cached["index"], cached["nodes"]
+        if not allow_build:
+            self.require_valid_index(kind, signature)
 
         nodes = self.build_summary_nodes()
-        index = self.load_or_build_index("summary_route", signature, nodes)
+        index = self.load_or_build_index(kind, signature, nodes, allow_build=allow_build)
         self._cache["summary_route"] = {
             "signature": signature,
             "index": index,
@@ -485,25 +676,31 @@ class LlamaIndexRetriever:
         }
         return index, nodes
 
-    def ensure_sentence_window_index(self, window_size):
-        window_size = max(0, min(8, int(window_size or 0)))
-        signature = self.source_signature("sentence_window", window_size)
-        cache_key = f"sentence_window:{window_size}"
-        cached = self._cache.get(cache_key)
-        if cached and cached["signature"] == signature:
-            return cached["index"], cached["nodes"]
-
-        nodes = self.build_sentence_window_nodes(window_size)
-        index = self.load_or_build_index(cache_key, signature, nodes)
-        self._cache[cache_key] = {"signature": signature, "index": index, "nodes": nodes}
-        return index, nodes
-
-    def ensure_auto_merging_index(self):
+    def ensure_auto_merging_index(self, allow_build=True):
         chunk_size, chunk_overlap, _, hierarchy_sizes = self.index_settings()
         signature = self.source_signature("auto_merging", hierarchy_sizes, chunk_overlap)
+        kind = "auto_merging"
         cached = self._cache.get("auto_merging")
         if cached and cached["signature"] == signature:
             return cached["index"], cached["storage_context"]
+        if self.can_load_persisted(self.persist_dir(kind) / "manifest.json", signature):
+            try:
+                index, storage_context = self.load_persisted_index(kind, signature)
+                self._cache["auto_merging"] = {
+                    "signature": signature,
+                    "index": index,
+                    "storage_context": storage_context,
+                }
+                return index, storage_context
+            except Exception:
+                LOGGER.exception("Failed to load persisted Auto Merging index")
+                if not allow_build:
+                    raise RAGIndexUnavailable(
+                        "Auto Merging 持久化索引加载失败，请到 RAG 维护里按当前参数重建索引。"
+                    )
+                shutil.rmtree(self.persist_dir(kind), ignore_errors=True)
+        elif not allow_build:
+            self.require_valid_index(kind, signature)
 
         nodes = self.build_hierarchy_nodes(hierarchy_sizes, chunk_overlap)
         leaf_nodes = get_leaf_nodes(nodes) if nodes else []
@@ -512,10 +709,11 @@ class LlamaIndexRetriever:
         storage_context = StorageContext.from_defaults()
         storage_context.docstore.add_documents(nodes)
         index = self.load_or_build_index(
-            "auto_merging",
+            kind,
             signature,
             leaf_nodes,
             storage_context=storage_context,
+            allow_build=allow_build,
         )
         self._cache["auto_merging"] = {
             "signature": signature,
@@ -524,21 +722,83 @@ class LlamaIndexRetriever:
         }
         return index, storage_context
 
-    def load_or_build_index(self, kind, signature, nodes, storage_context=None):
+    def require_valid_index(self, kind, signature):
+        manifest_path = self.persist_dir(kind) / "manifest.json"
+        if not self.can_load_persisted(manifest_path, signature):
+            raise RAGIndexUnavailable(
+                f"{self.index_display_name(kind)} 索引不存在或已过期，请到 RAG 维护里按当前参数重建索引。"
+            )
+
+    def append_retrieval_warning(self, message):
+        if not self.llm or not message:
+            return
+        current = getattr(self.llm, "last_embedding_error", "") or ""
+        if message in current:
+            return
+        prefix = "检索提示："
+        self.llm.last_embedding_error = (
+            f"{current}\n{prefix}{message}".strip()
+            if current
+            else f"{prefix}{message}"
+        )
+
+    def describe_retrieval_exception(self, exc, stage="LlamaIndex"):
+        text = str(exc) or repr(exc)
+        if isinstance(exc, RAGRetrievalError):
+            return text
+        if isinstance(exc, RAGIndexUnavailable):
+            return f"{stage} 检索失败：{text}"
+        lower = text.lower()
+        if "embedding" in lower or "embed" in lower:
+            return (
+                f"{stage} 检索失败：embedding 调用或向量生成失败。"
+                f"原始错误：{text}"
+            )
+        if "bm25" in lower:
+            return f"{stage} 检索失败：BM25 关键词检索构建或查询失败。原始错误：{text}"
+        if "load_index" in lower or "storage" in lower or "persist" in lower:
+            return (
+                f"{stage} 检索失败：LlamaIndex 持久化索引加载失败，"
+                f"请到 RAG 维护里重建索引。原始错误：{text}"
+            )
+        if "rerank" in lower:
+            return f"{stage} 检索失败：重排接口或 LlamaIndex rerank 失败。原始错误：{text}"
+        if "doc_id" in lower and "not found" in lower:
+            return (
+                f"{stage} 检索失败：Auto Merging 的向量索引和 docstore 不一致。"
+                "请到 RAG 维护里重建 Auto Merging / 全部 RAG 索引。"
+                f"原始错误：{text}"
+            )
+        return f"{stage} 检索失败：{type(exc).__name__}: {text}"
+
+    def index_display_name(self, kind):
+        return {
+            "summary_route": "Document Router / Summary Index",
+            "vector": "Vector/BM25 Fusion",
+            "auto_merging": "Auto Merging",
+        }.get(kind, str(kind))
+
+    def load_or_build_index(self, kind, signature, nodes, storage_context=None, allow_build=True):
         if not nodes:
             return None
         persist_dir = self.persist_dir(kind)
         manifest_path = persist_dir / "manifest.json"
         if self.can_load_persisted(manifest_path, signature):
             try:
-                storage_context = StorageContext.from_defaults(persist_dir=str(persist_dir))
-                return load_index_from_storage(
-                    storage_context,
-                    embed_model=self.embed_model,
-                )
+                index, _ = self.load_persisted_index(kind, signature)
+                return index
             except Exception:
                 LOGGER.exception("Failed to load persisted LlamaIndex %s index; rebuilding", kind)
+                if not allow_build:
+                    raise RAGIndexUnavailable(
+                        f"{self.index_display_name(kind)} 持久化索引加载失败，请到 RAG 维护里按当前参数重建索引。"
+                    )
                 shutil.rmtree(persist_dir, ignore_errors=True)
+
+        if not allow_build:
+            raise RAGIndexUnavailable(
+                f"{kind} 索引不存在或已过期，请到 RAG 维护里按当前参数重建索引。"
+            )
 
         persist_dir.mkdir(parents=True, exist_ok=True)
         if persist_dir.exists():
@@ -554,6 +814,20 @@ class LlamaIndexRetriever:
         self.write_manifest(manifest_path, signature, len(nodes))
         return index
 
+    def load_persisted_index(self, kind, signature):
+        persist_dir = self.persist_dir(kind)
+        manifest_path = persist_dir / "manifest.json"
+        if not self.can_load_persisted(manifest_path, signature):
+            raise RAGIndexUnavailable(
+                f"{self.index_display_name(kind)} 索引不存在或已过期，请到 RAG 维护里按当前参数重建索引。"
+            )
+        storage_context = StorageContext.from_defaults(persist_dir=str(persist_dir))
+        index = load_index_from_storage(
+            storage_context,
+            embed_model=self.embed_model,
+        )
+        return index, storage_context
+
     def set_embedding_progress_callback(self, callback=None, label=""):
         if self.embed_model and hasattr(self.embed_model, "set_progress_callback"):
             self.embed_model.set_progress_callback(callback, label)
@@ -567,10 +841,6 @@ class LlamaIndexRetriever:
         steps = [
             ("Summary Route", self.ensure_summary_index),
             ("Vector + BM25 Fusion", self.ensure_vector_index),
-            (
-                "Sentence Window",
-                lambda: self.ensure_sentence_window_index(self.index_settings()[2]),
-            ),
             ("Auto Merging", self.ensure_auto_merging_index),
         ]
         for index, (label, builder) in enumerate(steps, start=1):
@@ -603,7 +873,7 @@ class LlamaIndexRetriever:
             chunk_overlap=chunk_overlap,
         )
         nodes = parser.get_nodes_from_documents(self.llama_documents())
-        self.prepare_nodes(nodes, retrieval_stage="llamaindex_query_fusion")
+        self.prepare_nodes(nodes, retrieval_stage="llamaindex_hybrid_fusion")
         return nodes
 
     def build_summary_nodes(self):
@@ -622,16 +892,6 @@ class LlamaIndexRetriever:
             node.excluded_embed_metadata_keys = list(metadata.keys())
             node.excluded_llm_metadata_keys = list(metadata.keys())
             nodes.append(node)
-        return nodes
-
-    def build_sentence_window_nodes(self, window_size):
-        parser = SentenceWindowNodeParser.from_defaults(window_size=window_size)
-        nodes = parser.get_nodes_from_documents(self.llama_documents())
-        self.prepare_nodes(
-            nodes,
-            retrieval_stage="llamaindex_sentence_window",
-            extra_metadata={"window_size": window_size},
-        )
         return nodes
 
     def build_hierarchy_nodes(self, hierarchy_sizes, chunk_overlap):
@@ -714,23 +974,38 @@ class LlamaIndexRetriever:
 
     def metadata_filter(self, folder_filter="全部", source_filter="全部"):
         return {
-            "folder_filter": folder_filter or "全部",
-            "source_filter": source_filter or "全部",
+            "folder_filter": self.normalize_filter_values(folder_filter),
+            "source_filter": self.normalize_filter_values(source_filter),
         }
+
+    def normalize_filter_values(self, value):
+        if value in (None, "", "全部"):
+            return []
+        if isinstance(value, (list, tuple, set)):
+            return [str(item).strip() for item in value if str(item).strip() and str(item).strip() != "全部"]
+        return [
+            item.strip()
+            for item in str(value).split(",")
+            if item.strip() and item.strip() != "全部"
+        ]
 
     def metadata_matches(self, metadata, metadata_filter=None):
         if not metadata_filter:
             return True
-        folder_filter = metadata_filter.get("folder_filter") or "全部"
-        source_filter = metadata_filter.get("source_filter") or "全部"
+        folder_filter = metadata_filter.get("folder_filter") or []
+        source_filter = metadata_filter.get("source_filter") or []
         folder = metadata.get("folder") or "默认"
         source = metadata.get("source") or ""
-        if folder_filter != "全部" and folder != folder_filter:
+        if folder_filter and folder not in folder_filter:
             return False
-        if source_filter == "我的旧回答" and not str(source).startswith("past_answer:"):
-            return False
-        if source_filter == "上传文件" and str(source).startswith("past_answer:"):
-            return False
+        if source_filter:
+            is_past_answer = str(source).startswith("past_answer:")
+            source_matches = (
+                ("我的旧回答" in source_filter and is_past_answer)
+                or ("上传文件" in source_filter and not is_past_answer)
+            )
+            if not source_matches:
+                return False
         return True
 
     def filter_nodes(
@@ -791,23 +1066,17 @@ class LlamaIndexRetriever:
                             ranked_hits.append(hit)
                     return ranked_hits[:limit]
             except Exception as exc:
-                LOGGER.exception("DashScope text rerank failed; trying LlamaIndex LLMRerank")
+                LOGGER.exception("DashScope text rerank failed")
+                message = f"Rerank 检索失败：DashScope rerank 接口调用失败。原始错误：{exc}"
                 if self.llm:
-                    self.llm.last_embedding_error = f"DashScope rerank 失败，尝试 LLMRerank：{exc}"
-        try:
-            reranker = LLMRerank(
-                llm=self.llama_llm,
-                top_n=limit,
-                choice_batch_size=min(8, max(1, len(hits))),
-            )
-            return reranker.postprocess_nodes(hits, query_str=query)
-        except Exception as exc:
-            LOGGER.exception("LlamaIndex LLMRerank failed; keeping fusion order")
-            if self.llm:
-                self.llm.last_embedding_error = f"LlamaIndex rerank 失败，已保留融合排序：{exc}"
-            return hits[:limit]
+                    self.llm.last_embedding_error = message
+                raise RAGRetrievalError(message) from exc
+        message = "Rerank 检索失败：rerank 接口没有返回有效排序结果。可以关闭“启用千问 Rerank”后重试。"
+        if self.llm:
+            self.llm.last_embedding_error = message
+        raise RAGRetrievalError(message)
 
-    def node_to_result(self, hit, summary_routes=None, mode="llamaindex_query_fusion"):
+    def node_to_result(self, hit, summary_routes=None, mode="llamaindex_hybrid_fusion"):
         metadata = hit.node.metadata or {}
         route_map = {item["document_id"]: item for item in (summary_routes or [])}
         item = {
@@ -831,6 +1100,14 @@ class LlamaIndexRetriever:
             item["rerank_stage"] = metadata.get("rerank_stage")
         if metadata.get("window_size") is not None:
             item["window_size"] = metadata.get("window_size")
+        if metadata.get("window_unit"):
+            item["window_unit"] = metadata.get("window_unit")
+        if metadata.get("hit_chunk_index") is not None:
+            item["hit_chunk_index"] = metadata.get("hit_chunk_index")
+        if metadata.get("window_start_chunk") is not None:
+            item["window_start_chunk"] = metadata.get("window_start_chunk")
+        if metadata.get("window_end_chunk") is not None:
+            item["window_end_chunk"] = metadata.get("window_end_chunk")
         return self.legacy.with_route(item, route_map)
 
     def node_to_trace_item(self, hit):
@@ -882,11 +1159,16 @@ class LlamaIndexRetriever:
             LOGGER.exception("Failed to record retrieval trace")
 
     def result_mode(self, retrieval_mode):
+        if isinstance(retrieval_mode, (list, tuple, set)):
+            modes = self.normalize_retrieval_modes(list(retrieval_mode))
+            if len(modes) > 1:
+                return "llamaindex_multi_retriever_fusion"
+            retrieval_mode = modes[0]
         return {
-            "hybrid": "llamaindex_query_fusion",
-            "sentence_window": "llamaindex_sentence_window",
+            "hybrid": "llamaindex_hybrid_fusion",
+            "chunk_window": "llamaindex_chunk_window",
             "auto_merging": "llamaindex_auto_merging",
-        }.get(retrieval_mode, "llamaindex_query_fusion")
+        }.get(retrieval_mode, "llamaindex_hybrid_fusion")
 
     def index_settings(self):
         chunk_size = int(self.db.get_setting("rag_chunk_size", str(INDEX_CHUNK_SIZE)))
@@ -895,9 +1177,9 @@ class LlamaIndexRetriever:
         )
         chunk_size = max(300, min(4000, chunk_size))
         chunk_overlap = max(0, min(chunk_overlap, chunk_size - 1))
-        sentence_window_size = int(self.db.get_setting("rag_sentence_window_size", "3"))
+        chunk_window_size = int(self.db.get_setting("rag_chunk_window_size", "1"))
         hierarchy_sizes = [chunk_size, chunk_size * 3, chunk_size * 9]
-        return chunk_size, chunk_overlap, sentence_window_size, hierarchy_sizes
+        return chunk_size, chunk_overlap, chunk_window_size, hierarchy_sizes
 
     def source_signature(self, kind, *settings):
         source = [
@@ -933,7 +1215,7 @@ class LlamaIndexRetriever:
         return self.storage_dir / re.sub(r"[^a-zA-Z0-9_.:-]+", "_", kind)
 
     def expected_index_specs(self):
-        chunk_size, chunk_overlap, sentence_window_size, hierarchy_sizes = self.index_settings()
+        chunk_size, chunk_overlap, _, hierarchy_sizes = self.index_settings()
         return [
             (
                 "summary_route",
@@ -944,11 +1226,6 @@ class LlamaIndexRetriever:
                 "vector",
                 "Vector + BM25 Fusion",
                 self.source_signature("vector", chunk_size, chunk_overlap),
-            ),
-            (
-                f"sentence_window:{sentence_window_size}",
-                "Sentence Window",
-                self.source_signature("sentence_window", sentence_window_size),
             ),
             (
                 "auto_merging",
